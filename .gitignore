@@ -1,0 +1,9 @@
+# Ignore all __pycache__ folders anywhere
+__pycache__/
+**/__pycache__/
+
+# Ignore Python compiled files
+*.pyc
+
+# Ignore specific file
+packages.microsoft.gpg
