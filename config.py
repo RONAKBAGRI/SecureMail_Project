@@ -1,5 +1,5 @@
 # config.py
-PROXY_IP = "10.71.3.74"  # Ronak's IP
+PROXY_IP = "10.71.3.75"  # Ronak's IP
 PROXY_PORT = 8000
 
 SMTP_IP = "10.71.3.192"   # Gaurav's IP
