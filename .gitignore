@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+node2_proxy/secret.key
+node5_dns_spam/spam_log.txt
+storage/
+
+# IDEs and Editors
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Accidental downloads/system files
+packages.microsoft.gpg

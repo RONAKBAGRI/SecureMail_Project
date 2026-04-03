@@ -1,89 +1,79 @@
-import tkinter as tk
-from tkinter import ttk
+"""
+Node 4 – Admin Dashboard (Sunny)
+Live CLI view of mailbox stats, refreshes every 5 seconds.
+Run independently: python node4_pop3/admin_dashboard.py
+"""
 import os
 import sys
+import time
+import json
+import datetime
 
-# Paths
-STORAGE_BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'storage'))
-SPAM_LOG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'node5_dns_spam', 'spam_log.txt'))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
 
-class AdminDashboard:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("System Admin Dashboard")
-        self.root.geometry("400x350")
-        self.root.configure(bg="#1e1e2e")
-        
-        # Styling
-        style = ttk.Style()
-        style.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4", font=("Arial", 12))
-        style.configure("Header.TLabel", font=("Arial", 18, "bold"), foreground="#89b4fa")
-        
-        # Header
-        ttk.Label(root, text="Email System Metrics", style="Header.TLabel").pack(pady=20)
-        
-        # Metric Labels
-        self.lbl_users = ttk.Label(root, text="Active Users: 0")
-        self.lbl_users.pack(pady=10)
-        
-        self.lbl_emails = ttk.Label(root, text="Total Emails Stored: 0")
-        self.lbl_emails.pack(pady=10)
-        
-        self.lbl_spam = ttk.Label(root, text="Spam Intercepted: 0")
-        self.lbl_spam.pack(pady=10)
-        
-        self.lbl_size = ttk.Label(root, text="Storage Used: 0 KB")
-        self.lbl_size.pack(pady=10)
-        
-        # Start the update loop
-        self.update_metrics()
 
-    def update_metrics(self):
-        """Calculates system metrics by scanning the file system."""
-        total_users = 0
-        total_emails = 0
-        total_size_bytes = 0
-        total_spam = 0
-        
-        # Check Storage
-        if os.path.exists(STORAGE_BASE):
-            users = os.listdir(STORAGE_BASE)
-            total_users = len(users)
-            
-            for user in users:
-                user_inbox = os.path.join(STORAGE_BASE, user, 'inbox')
-                user_spam = os.path.join(STORAGE_BASE, user, 'spam')
-                
-                # Count inbox emails & sizes
-                if os.path.exists(user_inbox):
-                    for f in os.listdir(user_inbox):
-                        filepath = os.path.join(user_inbox, f)
-                        if os.path.isfile(filepath):
-                            total_emails += 1
-                            total_size_bytes += os.path.getsize(filepath)
-                            
-                # Count stored spam
-                if os.path.exists(user_spam):
-                    for f in os.listdir(user_spam):
-                        filepath = os.path.join(user_spam, f)
-                        if os.path.isfile(filepath):
-                            total_size_bytes += os.path.getsize(filepath)
-        
-        # Check Amit's Spam Log (if Amit has created it yet)
-        if os.path.exists(SPAM_LOG_FILE):
-            with open(SPAM_LOG_FILE, 'r') as f:
-                total_spam = sum(1 for line in f)
+def _count_and_size(folder_path: str) -> tuple[int, int]:
+    """Returns (count, total_bytes) for .enc files in a folder."""
+    if not os.path.exists(folder_path):
+        return 0, 0
+    files = [f for f in os.listdir(folder_path) if f.endswith(".enc")]
+    total = sum(os.path.getsize(os.path.join(folder_path, f)) for f in files)
+    return len(files), total
 
-        # Update GUI text
-        self.lbl_users.config(text=f"Active Users: {total_users}")
-        self.lbl_emails.config(text=f"Total Emails Stored: {total_emails}")
-        self.lbl_spam.config(text=f"Spam Intercepted: {total_spam}")
-        self.lbl_size.config(text=f"Storage Used: {total_size_bytes / 1024:.2f} KB")
-        
-        # Schedule the next update in 3000ms (3 seconds)
-        self.root.after(3000, self.update_metrics)
+
+def _read_meta(filepath: str) -> dict:
+    meta = filepath.replace(".enc", ".meta")
+    if os.path.exists(meta):
+        try:
+            with open(meta) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def print_dashboard():
+    while True:
+        os.system("cls" if os.name == "nt" else "clear")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        print("╔══════════════════════════════════════════════════╗")
+        print("║         SECUREMAIL – ADMIN DASHBOARD (Node 4)   ║")
+        print(f"║  Refreshed: {now}              ║")
+        print("╠══════════════════════════════════════════════════╣")
+
+        storage = config.SHARED_STORAGE_DIR
+        if not os.path.exists(storage):
+            print("║  No storage directory found yet.                ║")
+            print("╚══════════════════════════════════════════════════╝")
+            time.sleep(5)
+            continue
+
+        total_inbox = total_spam = 0
+        for user in sorted(os.listdir(storage)):
+            user_path = os.path.join(storage, user)
+            if not os.path.isdir(user_path):
+                continue
+
+            inbox_cnt, inbox_sz = _count_and_size(os.path.join(user_path, "inbox"))
+            spam_cnt,  spam_sz  = _count_and_size(os.path.join(user_path, "spam"))
+            total_inbox += inbox_cnt
+            total_spam  += spam_cnt
+
+            print(f"║  User: {user:<38} ║")
+            print(f"║    Inbox : {inbox_cnt:3} messages  ({inbox_sz:>8} bytes)          ║")
+            print(f"║    Spam  : {spam_cnt:3} messages  ({spam_sz:>8} bytes)          ║")
+            print("║  ────────────────────────────────────────────  ║")
+
+        print(f"║  TOTAL  Inbox: {total_inbox:<5}  |  Spam: {total_spam:<5}              ║")
+        print("╚══════════════════════════════════════════════════╝")
+        print("  (Press Ctrl+C to exit)")
+        time.sleep(5)
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = AdminDashboard(root)
-    root.mainloop()
+    try:
+        print_dashboard()
+    except KeyboardInterrupt:
+        print("\nDashboard stopped.")
