@@ -20,7 +20,7 @@ import logging
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
-from spam_filter import is_spam
+from spam_filter import SpamFilterModule
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +31,14 @@ log = logging.getLogger(__name__)
 USERS_FILE = os.path.join(os.path.dirname(__file__), "valid_users.json")
 LISTEN_IP  = "0.0.0.0"
 _file_lock = threading.Lock()
+
+# ── Initialize Machine Learning Spam Scanner ──────────────────────────────────
+# Load the model into RAM exactly once when the server starts
+try:
+    scanner = SpamFilterModule()
+except Exception as e:
+    log.error(f"Could not load AI Spam Scanner: {e}")
+    scanner = None
 
 
 # ── User file helpers ─────────────────────────────────────────────────────────
@@ -62,8 +70,15 @@ def _process(req: dict) -> dict:
         return {"status": "OK" if valid else "FAIL"}
 
     elif action == "SPAM_CHECK":
-        content     = req.get("content", "")
-        spam_result = is_spam(content)
+        content = req.get("content", "")
+        
+        # Use the loaded ML model for prediction
+        if scanner:
+            spam_result = scanner.is_spam(content)
+        else:
+            log.warning("Spam scanner unavailable, defaulting to false.")
+            spam_result = False
+            
         log.info(f"SPAM_CHECK → is_spam={spam_result}")
         return {"is_spam": spam_result}
 
