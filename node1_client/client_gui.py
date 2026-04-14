@@ -24,10 +24,10 @@ YELLOW = "#d29922"
 WHITE  = "#e6edf3"
 MUTED  = "#8b949e"
 
-FONT   = ("Courier New", 10)
-FONT_B = ("Courier New", 10, "bold")
-FONT_H = ("Courier New", 15, "bold")
-FONT_S = ("Courier New", 9)
+FONT   = ("TkDefaultFont", 10)
+FONT_B = ("TkDefaultFont", 10, "bold")
+FONT_H = ("TkDefaultFont", 15, "bold")
+FONT_S = ("TkDefaultFont", 9)
 
 
 # ── Widget factories ──────────────────────────────────────────────────────────
@@ -155,7 +155,7 @@ class LoginScreen(tk.Frame):
         wrap = tk.Frame(self, bg=BG)
         wrap.place(relx=0.5, rely=0.5, anchor="center")
 
-        tk.Label(wrap, text="◉  SecureMail", font=("Courier New", 22, "bold"),
+        tk.Label(wrap, text="◉  SecureMail", font=("TkDefaultFont", 22, "bold"),
                  bg=BG, fg=GREEN).pack(pady=(0, 4))
         tk.Label(wrap, text="Distributed Email System — Group 7",
                  font=FONT_S, bg=BG, fg=MUTED).pack(pady=(0, 28))
@@ -237,7 +237,7 @@ class MainApp(tk.Frame):
         hdr = tk.Frame(self, bg=PANEL,
                        highlightthickness=1, highlightbackground=BORDER)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="◉  SecureMail", font=("Courier New", 13, "bold"),
+        tk.Label(hdr, text="◉  SecureMail", font=("TkDefaultFont", 13, "bold"),
                  bg=PANEL, fg=GREEN, padx=16, pady=8).pack(side="left")
         tk.Label(hdr, text=self._email, font=FONT_S,
                  bg=PANEL, fg=MUTED, padx=6).pack(side="left")
