@@ -1,22 +1,28 @@
 """
 Node 4 – POP3 Server / MAA (Sunny)
-
+=====================================
 Handles: USER, PASS, STAT, LIST, RETR, DELE, RSET, NOOP, QUIT
+Extended: XFOLDER <folder>   – switch active folder (inbox / spam)
+          XDELE <n>          – immediately delete message #n from active
+                               folder AND notify Node 3 to delete its copy
+
 On startup also launches:
-  • file_receiver  – receives emails pushed from Node 3 (port 4501)
-  • registration_server – handles new user signups (port 4502)
+  • file_receiver       – receives emails pushed from Node 3 (port 4501)
+  • registration_server – handles new user signups         (port 4502)
 """
+
 import socket
 import threading
 import os
 import sys
+import json
 import logging
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
-from file_receiver import start_file_receiver
-from registration_server import start_registration_server
-from user_manager import load_users
+from file_receiver        import start_file_receiver
+from registration_server  import start_registration_server
+from user_manager         import load_users
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,10 +30,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-LISTEN_IP = "0.0.0.0"
+LISTEN_IP       = "0.0.0.0"
+VALID_FOLDERS   = {"inbox", "spam"}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Socket helpers ────────────────────────────────────────────────────────────
 
 def _recv_line(sock: socket.socket) -> str:
     buf = b""
@@ -39,21 +46,74 @@ def _recv_line(sock: socket.socket) -> str:
     return buf.decode("utf-8", errors="replace").rstrip("\r\n")
 
 
-def _get_inbox_files(username: str) -> list:
-    """Return sorted list of .enc filenames in the user's inbox."""
-    inbox = os.path.join(config.SHARED_STORAGE_DIR, username, "inbox")
-    if not os.path.exists(inbox):
+# ── Storage helpers ───────────────────────────────────────────────────────────
+
+def _get_folder_files(username: str, folder: str) -> list:
+    """Return sorted list of .enc filenames in the user's folder."""
+    path = os.path.join(config.SHARED_STORAGE_DIR, username, folder)
+    if not os.path.exists(path):
         return []
-    return sorted(f for f in os.listdir(inbox) if f.endswith(".enc"))
+    return sorted(f for f in os.listdir(path) if f.endswith(".enc"))
+
+
+def _delete_file(username: str, folder: str, filename: str) -> None:
+    """Delete .enc and companion .meta file from Node 4 storage."""
+    base = os.path.join(config.SHARED_STORAGE_DIR, username, folder, filename)
+    for path in (base, base.replace(".enc", ".meta")):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                log.info(f"[DELETE] Removed {path}")
+        except OSError as e:
+            log.error(f"[DELETE] Could not remove {path}: {e}")
+
+
+# ── Node 3 deletion notification ──────────────────────────────────────────────
+
+def _notify_node3_delete(username: str, folder: str, filename: str) -> bool:
+    """
+    Tell Node 3 to delete its local copy of this email.
+    Connects directly to Node 3 on DELETE_PORT (4503).
+    Returns True if Node 3 acknowledged, False otherwise (non-fatal).
+    """
+    payload = json.dumps({
+        "username": username,
+        "folder":   folder,
+        "filename": filename,
+    }).encode("utf-8")
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect((config.SMTP_IP, config.DELETE_PORT))
+        sock.sendall(len(payload).to_bytes(4, "big") + payload)
+        ack = sock.recv(8).strip()
+        sock.close()
+        if ack == b"ACK":
+            log.info(f"[DELETE] Node 3 confirmed deletion of {filename}")
+            return True
+        else:
+            log.warning(f"[DELETE] Node 3 gave unexpected ack: {ack!r}")
+            return False
+    except ConnectionRefusedError:
+        log.warning("[DELETE] Node 3 delete server unreachable — file may remain on Node 3.")
+        return False
+    except socket.timeout:
+        log.warning("[DELETE] Timed out notifying Node 3.")
+        return False
+    except Exception as e:
+        log.warning(f"[DELETE] Could not notify Node 3: {e}")
+        return False
 
 
 # ── Per-session handler ───────────────────────────────────────────────────────
 
 def _handle_client(conn: socket.socket, addr):
-    users    = load_users()   # fresh credential snapshot for this session
-    username = None
-    authed   = False
-    deleted  = set()          # 1-based indices marked for deletion this session
+    users         = load_users()   # fresh credential snapshot for this session
+    username      = None
+    authed        = False
+    active_folder = "inbox"        # default folder; changed by XFOLDER
+    deleted       = set()          # 1-based indices marked for standard DELE
 
     try:
         conn.sendall(b"+OK SecureMail POP3 Server Ready\r\n")
@@ -67,7 +127,7 @@ def _handle_client(conn: socket.socket, addr):
             cmd = parts[0].upper()
             arg = parts[1] if len(parts) > 1 else ""
 
-            # ── Pre-auth ──────────────────────────────────────────
+            # ── Pre-auth commands ──────────────────────────────────────────────
             if cmd == "USER":
                 username = arg.strip().lower()
                 conn.sendall(b"+OK Send PASS\r\n")
@@ -83,40 +143,79 @@ def _handle_client(conn: socket.socket, addr):
                     username = None
 
             elif cmd == "QUIT":
-                # Apply pending deletions before closing
+                # Apply pending standard DELE deletions before closing
                 if authed and deleted:
-                    files = _get_inbox_files(username)
-                    inbox = os.path.join(config.SHARED_STORAGE_DIR, username, "inbox")
+                    files = _get_folder_files(username, active_folder)
                     for idx in sorted(deleted, reverse=True):
                         if 1 <= idx <= len(files):
-                            path = os.path.join(inbox, files[idx - 1])
-                            try:
-                                os.remove(path)
-                                meta = path.replace(".enc", ".meta")
-                                if os.path.exists(meta):
-                                    os.remove(meta)
-                                log.info(f"Deleted message #{idx}")
-                            except OSError as e:
-                                log.error(f"Could not delete #{idx}: {e}")
+                            fname = files[idx - 1]
+                            _delete_file(username, active_folder, fname)
+                            _notify_node3_delete(username, active_folder, fname)
                 conn.sendall(b"+OK Bye\r\n")
                 break
 
-            # ── Auth-gated ────────────────────────────────────────
+            # ── Require authentication for all commands below ──────────────────
             elif not authed:
                 conn.sendall(b"-ERR Not authenticated\r\n")
 
+            # ── XFOLDER: switch active folder  (NEW) ──────────────────────────
+            elif cmd == "XFOLDER":
+                requested = arg.strip().lower()
+                if requested not in VALID_FOLDERS:
+                    conn.sendall(
+                        f"-ERR Unknown folder '{requested}'. "
+                        f"Valid: {', '.join(VALID_FOLDERS)}\r\n".encode()
+                    )
+                else:
+                    active_folder = requested
+                    deleted.clear()    # reset deletion marks when folder changes
+                    count = len(_get_folder_files(username, active_folder))
+                    conn.sendall(
+                        f"+OK Switched to {active_folder} "
+                        f"({count} message(s))\r\n".encode()
+                    )
+                    log.info(f"[{username}] XFOLDER → {active_folder}")
+
+            # ── XDELE: immediate delete + Node 3 notification  (NEW) ──────────
+            elif cmd == "XDELE":
+                files = _get_folder_files(username, active_folder)
+                try:
+                    idx = int(arg)
+                except ValueError:
+                    conn.sendall(b"-ERR Invalid message number\r\n")
+                    continue
+
+                if idx < 1 or idx > len(files):
+                    conn.sendall(b"-ERR No such message\r\n")
+                    continue
+
+                fname = files[idx - 1]
+                _delete_file(username, active_folder, fname)
+                _notify_node3_delete(username, active_folder, fname)
+                conn.sendall(
+                    f"+OK Message #{idx} ({fname}) permanently deleted\r\n"
+                    .encode()
+                )
+                log.info(f"[{username}] XDELE #{idx} ({fname}) from {active_folder}")
+
+            # ── STAT ───────────────────────────────────────────────────────────
             elif cmd == "STAT":
-                files  = _get_inbox_files(username)
+                files  = _get_folder_files(username, active_folder)
                 active = [f for i, f in enumerate(files, 1) if i not in deleted]
-                inbox  = os.path.join(config.SHARED_STORAGE_DIR, username, "inbox")
-                total  = sum(
-                    os.path.getsize(os.path.join(inbox, f)) for f in active
+                folder_path = os.path.join(
+                    config.SHARED_STORAGE_DIR, username, active_folder
+                )
+                total = sum(
+                    os.path.getsize(os.path.join(folder_path, f)) for f in active
                 )
                 conn.sendall(f"+OK {len(active)} {total}\r\n".encode())
 
+            # ── LIST ───────────────────────────────────────────────────────────
             elif cmd == "LIST":
-                files = _get_inbox_files(username)
-                inbox = os.path.join(config.SHARED_STORAGE_DIR, username, "inbox")
+                files       = _get_folder_files(username, active_folder)
+                folder_path = os.path.join(
+                    config.SHARED_STORAGE_DIR, username, active_folder
+                )
                 if arg:
                     try:
                         idx = int(arg)
@@ -126,18 +225,19 @@ def _handle_client(conn: socket.socket, addr):
                     if idx in deleted or idx < 1 or idx > len(files):
                         conn.sendall(b"-ERR No such message\r\n")
                     else:
-                        sz = os.path.getsize(os.path.join(inbox, files[idx - 1]))
+                        sz = os.path.getsize(os.path.join(folder_path, files[idx - 1]))
                         conn.sendall(f"+OK {idx} {sz}\r\n".encode())
                 else:
                     active = [(i, f) for i, f in enumerate(files, 1) if i not in deleted]
                     lines  = [f"+OK {len(active)} messages"]
                     for i, f in active:
-                        sz = os.path.getsize(os.path.join(inbox, f))
+                        sz = os.path.getsize(os.path.join(folder_path, f))
                         lines.append(f"{i} {sz}")
                     conn.sendall(("\r\n".join(lines) + "\r\n.\r\n").encode())
 
+            # ── RETR ───────────────────────────────────────────────────────────
             elif cmd == "RETR":
-                files = _get_inbox_files(username)
+                files = _get_folder_files(username, active_folder)
                 try:
                     idx = int(arg)
                 except ValueError:
@@ -146,17 +246,20 @@ def _handle_client(conn: socket.socket, addr):
                 if idx in deleted or idx < 1 or idx > len(files):
                     conn.sendall(b"-ERR No such message\r\n")
                 else:
-                    inbox    = os.path.join(config.SHARED_STORAGE_DIR, username, "inbox")
-                    filepath = os.path.join(inbox, files[idx - 1])
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        body = f.read()
+                    folder_path = os.path.join(
+                        config.SHARED_STORAGE_DIR, username, active_folder
+                    )
+                    filepath = os.path.join(folder_path, files[idx - 1])
+                    with open(filepath, "r", encoding="utf-8") as fh:
+                        body = fh.read()
                     size = os.path.getsize(filepath)
                     conn.sendall(f"+OK {size} octets\r\n".encode())
                     conn.sendall(body.encode("utf-8") + b"\r\n.\r\n")
-                    log.info(f"RETR #{idx} → {files[idx - 1]} ({size} B)")
+                    log.info(f"RETR #{idx} from {active_folder} → {files[idx - 1]} ({size} B)")
 
+            # ── DELE (standard: marks for deletion at QUIT) ────────────────────
             elif cmd == "DELE":
-                files = _get_inbox_files(username)
+                files = _get_folder_files(username, active_folder)
                 try:
                     idx = int(arg)
                 except ValueError:
@@ -166,12 +269,16 @@ def _handle_client(conn: socket.socket, addr):
                     conn.sendall(b"-ERR No such message\r\n")
                 else:
                     deleted.add(idx)
-                    conn.sendall(f"+OK Message #{idx} marked for deletion\r\n".encode())
+                    conn.sendall(
+                        f"+OK Message #{idx} marked for deletion\r\n".encode()
+                    )
 
+            # ── RSET ───────────────────────────────────────────────────────────
             elif cmd == "RSET":
                 deleted.clear()
                 conn.sendall(b"+OK Deleted messages restored\r\n")
 
+            # ── NOOP ───────────────────────────────────────────────────────────
             elif cmd == "NOOP":
                 conn.sendall(b"+OK\r\n")
 
