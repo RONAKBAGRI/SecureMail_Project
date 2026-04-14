@@ -1,4 +1,4 @@
-
+"""Generates JSON metadata receipts alongside stored emails."""
 import json
 import os
 import datetime
