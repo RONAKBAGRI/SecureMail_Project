@@ -8,6 +8,7 @@ Handles: HELO/EHLO, MAIL FROM, RCPT TO, DATA, RSET, NOOP, QUIT
   • Stores encrypted body to local disk
   • Writes metadata receipt
   • Immediately pushes email to Node 4 via TCP (file_pusher)
+  • Listens for deletion requests from Node 4 on DELETE_PORT (delete_server)
   • Multi-threaded
 """
 
@@ -22,8 +23,9 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from udp_client_helper import verify_user, check_spam_score
-from receipt_manager import generate_receipt
-from file_pusher import push_email
+from receipt_manager   import generate_receipt
+from file_pusher       import push_email
+from delete_server     import start_delete_server          # ← NEW
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,10 +104,7 @@ def _handle_client(conn: socket.socket, addr):
                     log.warning(f"RCPT TO rejected: {rcpt}")
                     rcpt = None
 
-            # ───────────────────────────────────────────────────────────────
-            # ✅ FIXED DATA HANDLING WITH PROXY SPAM FLAG
-            # ───────────────────────────────────────────────────────────────
-
+            # ── DATA – store + push ────────────────────────────────────────────
             elif cmd == "DATA":
                 if not sender or not rcpt:
                     conn.sendall(b"503 Bad sequence of commands\r\n")
@@ -118,7 +117,7 @@ def _handle_client(conn: socket.socket, addr):
                 # Remove SMTP terminator
                 raw_stripped = raw[:-5]
 
-                # Try to extract spam flag from Node 2 proxy
+                # Try to extract spam flag injected by Node 2 proxy
                 first_newline = raw_stripped.find(b"\r\n")
 
                 if first_newline != -1:
@@ -128,26 +127,22 @@ def _handle_client(conn: socket.socket, addr):
 
                     if flag_line in ("SPAM:YES", "SPAM:NO"):
                         is_spam = (flag_line == "SPAM:YES")
-                        body = raw_stripped[first_newline + 2:].decode(
+                        body    = raw_stripped[first_newline + 2:].decode(
                             "utf-8", errors="replace"
                         )
                         log.info(f"Spam flag from proxy: {flag_line}")
-
                     else:
-                        # Fallback: no valid flag
-                        body = raw_stripped.decode("utf-8", errors="replace")
+                        body    = raw_stripped.decode("utf-8", errors="replace")
                         is_spam = check_spam_score(body)
                         log.warning("No spam flag from proxy; fallback to local check.")
-
                 else:
-                    # Edge case: no newline found
-                    body = raw_stripped.decode("utf-8", errors="replace")
+                    body    = raw_stripped.decode("utf-8", errors="replace")
                     is_spam = check_spam_score(body)
                     log.warning("Malformed DATA: fallback to local spam check.")
 
                 folder = "spam" if is_spam else "inbox"
 
-                # ── Store email ────────────────────────────────────────────
+                # ── Store email on Node 3 ──────────────────────────────────────
                 save_dir = os.path.join(config.SHARED_STORAGE_DIR, rcpt, folder)
                 os.makedirs(save_dir, exist_ok=True)
 
@@ -158,24 +153,22 @@ def _handle_client(conn: socket.socket, addr):
                     f.write(body)
 
                 meta = {
-                    "sender": sender,
+                    "sender":    sender,
                     "recipient": rcpt,
                     "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                    "status": "Quarantined" if is_spam else "Delivered",
-                    "spam": is_spam,
+                    "status":    "Quarantined" if is_spam else "Delivered",
+                    "spam":      is_spam,
                 }
 
                 generate_receipt(filepath, sender, rcpt, is_spam)
 
-                # ── Push to Node 4 ────────────────────────────────────────
+                # ── Push to Node 4 ─────────────────────────────────────────────
                 push_email(rcpt, folder, filename, body, meta)
 
                 log.info(f"Stored + pushed: {filepath} | spam={is_spam}")
                 conn.sendall(b"250 Message accepted for delivery\r\n")
 
                 sender, rcpt = None, None
-
-            # ───────────────────────────────────────────────────────────────
 
             elif cmd == "RSET":
                 sender, rcpt = None, None
@@ -209,6 +202,8 @@ def _handle_client(conn: socket.socket, addr):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    start_delete_server()   # ← NEW: port 4503 — receives delete notifications from Node 4
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((LISTEN_IP, config.SMTP_PORT))
