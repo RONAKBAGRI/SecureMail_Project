@@ -58,7 +58,19 @@ def add_user(email: str, password: str) -> tuple:
             return False, "User already exists."
 
         try:
-            with open(USERS_FILE, "a") as f:
+            # Open in append + read mode (a+) to check the last character
+            with open(USERS_FILE, "a+") as f:
+                # Move to the end of the file
+                f.seek(0, os.SEEK_END)
+                file_size = f.tell()
+                
+                if file_size > 0:
+                    # Move back one character to see if it's a newline
+                    f.seek(file_size - 1)
+                    if f.read(1) != "\n":
+                        f.write("\n")
+                
+                # Now write the new user safely on a new line
                 f.write(f"{email}:{password}\n")
         except OSError as e:
             return False, f"Could not write users file: {e}"
