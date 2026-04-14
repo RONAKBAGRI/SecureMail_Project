@@ -1,33 +1,41 @@
+"""Keyword-based spam classifier with logging."""
 import os
+import datetime
+import logging
 
-def check_spam(email_body):
-    score = 0
-    # Find the keywords file in the same directory
-    keywords_file = os.path.join(os.path.dirname(__file__), 'spam_keywords.txt')
-    
-    try:
-        with open(keywords_file, 'r') as f:
-            # Read words and convert to lowercase
-            keywords = [line.strip().lower() for line in f if line.strip()]
-    except FileNotFoundError:
-        print("[!] Warning: spam_keywords.txt not found. Using defaults.")
-        keywords = ["lottery", "urgent", "winner", "password"]
+log = logging.getLogger(__name__)
 
-    body_lower = email_body.lower()
+KEYWORDS_FILE = os.path.join(os.path.dirname(__file__), "spam_keywords.txt")
+SPAM_LOG_FILE = os.path.join(os.path.dirname(__file__), "spam_log.txt")
 
-    # Rule 1: Check for blacklisted keywords
-    for word in keywords:
-        if word in body_lower:
-            score += 15  # Add 15 points for every bad word found
 
-    # Rule 2: Heuristic - Too many links
-    if body_lower.count("http") >= 2:
-        score += 20
-        
-    # Rule 3: Heuristic - SHOUTING
-    if email_body.isupper() and len(email_body) > 10:
-        score += 30
+def _load_keywords() -> list[str]:
+    if not os.path.exists(KEYWORDS_FILE):
+        return []
+    with open(KEYWORDS_FILE, "r") as f:
+        return [line.strip().lower() for line in f if line.strip()]
 
-    # Threshold: If score is 30 or more, it is spam
-    is_spam = score >= 30
-    return is_spam, score
+
+def is_spam(content: str) -> bool:
+    """
+    Returns True if the content contains any spam keywords.
+    Logs detections to spam_log.txt.
+    """
+    keywords = _load_keywords()
+    content_lower = content.lower()
+
+    hits = [kw for kw in keywords if kw in content_lower]
+    if hits:
+        entry = (
+            f"[{datetime.datetime.now().isoformat()}] "
+            f"SPAM DETECTED – Keywords: {', '.join(hits)}\n"
+        )
+        try:
+            with open(SPAM_LOG_FILE, "a") as logf:
+                logf.write(entry)
+        except OSError as e:
+            log.error(f"Could not write spam log: {e}")
+        log.warning(f"Spam detected. Keywords matched: {hits}")
+        return True
+
+    return False
