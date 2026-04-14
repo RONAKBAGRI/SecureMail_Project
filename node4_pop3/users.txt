@@ -1,3 +1,2 @@
-prashant:password123
-testuser:admin123
-demo:demo2024
+prashant@project.local:password123
+testuser@project.local:password456
