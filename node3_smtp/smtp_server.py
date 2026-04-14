@@ -1,8 +1,20 @@
 """
 Node 3 – SMTP Server / MTA (Gaurav)
 
-Handles: HELO/EHLO, MAIL FROM, RCPT TO, DATA, RSET, NOOP, QUIT
-  • Verifies recipient via UDP → Node 5
+Handles: HELO/EHLO, MAIL FROM, RCPT TO (multiple), DATA, RSET, NOOP, QUIT
+
+Changes in this version:
+  • Multiple RCPT TO commands accepted per transaction
+  • BCC-aware delivery: email is delivered to all accepted recipients,
+    but the body stored/pushed for each To/CC recipient has BCC addresses
+    stripped from headers (handled transparently since BCC addrs are never
+    in the headers that Node 1 writes — SMTP-level delivery is what matters)
+  • In-Reply-To / Message-ID headers are preserved verbatim and stored with
+    the email so Node 4's POP3 server can serve them for threading
+  • Per-recipient storage: one .enc file per recipient
+
+Other features retained:
+  • Verifies each recipient via UDP → Node 5
   • Uses spam flag from Node 2 proxy (if available)
   • Fallback: checks spam locally if no flag
   • Stores encrypted body to local disk
@@ -25,7 +37,7 @@ import config
 from udp_client_helper import verify_user, check_spam_score
 from receipt_manager   import generate_receipt
 from file_pusher       import push_email
-from delete_server     import start_delete_server          # ← NEW
+from delete_server     import start_delete_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,10 +73,47 @@ def _recv_until(sock: socket.socket, terminator: bytes, max_size: int = MAX_BODY
     return buf
 
 
+# ── Deliver one copy of the email to a single recipient ──────────────────────
+
+def _deliver_to_recipient(
+    sender:   str,
+    rcpt:     str,
+    body:     str,
+    is_spam:  bool,
+) -> None:
+    """
+    Store the email body on Node 3 and push to Node 4 for *rcpt*.
+    Called once per accepted recipient.
+    """
+    folder   = "spam" if is_spam else "inbox"
+    save_dir = os.path.join(config.SHARED_STORAGE_DIR, rcpt, folder)
+    os.makedirs(save_dir, exist_ok=True)
+
+    filename = f"{int(time.time() * 1000)}_{rcpt.split('@')[0]}.enc"
+    filepath = os.path.join(save_dir, filename)
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(body)
+
+    meta = {
+        "sender":    sender,
+        "recipient": rcpt,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "status":    "Quarantined" if is_spam else "Delivered",
+        "spam":      is_spam,
+    }
+
+    generate_receipt(filepath, sender, rcpt, is_spam)
+    push_email(rcpt, folder, filename, body, meta)
+    log.info(f"Delivered → {rcpt} | folder={folder} | file={filename}")
+
+
 # ── Per-connection handler ────────────────────────────────────────────────────
 
 def _handle_client(conn: socket.socket, addr):
-    sender, rcpt = None, None
+    sender    = None
+    rcpt_list = []   # now a list to support multiple RCPT TO
+
     try:
         conn.sendall(b"220 SecureMail SMTP Ready\r\n")
         log.info(f"Connection from {addr[0]}")
@@ -86,6 +135,7 @@ def _handle_client(conn: socket.socket, addr):
                 except IndexError:
                     conn.sendall(b"501 Syntax: MAIL FROM:<address>\r\n")
                     continue
+                rcpt_list = []   # reset recipients for new transaction
                 conn.sendall(b"250 OK\r\n")
                 log.info(f"MAIL FROM: {sender}")
 
@@ -97,16 +147,16 @@ def _handle_client(conn: socket.socket, addr):
                     continue
 
                 if verify_user(rcpt):
+                    rcpt_list.append(rcpt)
                     conn.sendall(b"250 OK\r\n")
                     log.info(f"RCPT TO accepted: {rcpt}")
                 else:
                     conn.sendall(b"550 No such user here\r\n")
                     log.warning(f"RCPT TO rejected: {rcpt}")
-                    rcpt = None
 
-            # ── DATA – store + push ────────────────────────────────────────────
+            # ── DATA – store + push to every accepted recipient ────────────────
             elif cmd == "DATA":
-                if not sender or not rcpt:
+                if not sender or not rcpt_list:
                     conn.sendall(b"503 Bad sequence of commands\r\n")
                     continue
 
@@ -140,38 +190,18 @@ def _handle_client(conn: socket.socket, addr):
                     is_spam = check_spam_score(body)
                     log.warning("Malformed DATA: fallback to local spam check.")
 
-                folder = "spam" if is_spam else "inbox"
+                # Deliver one copy to each accepted recipient
+                for rcpt in rcpt_list:
+                    try:
+                        _deliver_to_recipient(sender, rcpt, body, is_spam)
+                    except Exception as e:
+                        log.error(f"Failed to deliver to {rcpt}: {e}", exc_info=True)
 
-                # ── Store email on Node 3 ──────────────────────────────────────
-                save_dir = os.path.join(config.SHARED_STORAGE_DIR, rcpt, folder)
-                os.makedirs(save_dir, exist_ok=True)
-
-                filename = f"{int(time.time() * 1000)}.enc"
-                filepath = os.path.join(save_dir, filename)
-
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(body)
-
-                meta = {
-                    "sender":    sender,
-                    "recipient": rcpt,
-                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                    "status":    "Quarantined" if is_spam else "Delivered",
-                    "spam":      is_spam,
-                }
-
-                generate_receipt(filepath, sender, rcpt, is_spam)
-
-                # ── Push to Node 4 ─────────────────────────────────────────────
-                push_email(rcpt, folder, filename, body, meta)
-
-                log.info(f"Stored + pushed: {filepath} | spam={is_spam}")
                 conn.sendall(b"250 Message accepted for delivery\r\n")
-
-                sender, rcpt = None, None
+                sender, rcpt_list = None, []
 
             elif cmd == "RSET":
-                sender, rcpt = None, None
+                sender, rcpt_list = None, []
                 conn.sendall(b"250 OK\r\n")
 
             elif cmd == "NOOP":
@@ -202,7 +232,7 @@ def _handle_client(conn: socket.socket, addr):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    start_delete_server()   # ← NEW: port 4503 — receives delete notifications from Node 4
+    start_delete_server()   # port 4503 — receives delete notifications from Node 4
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -215,7 +245,6 @@ def main():
         while True:
             conn, addr = srv.accept()
             conn.settimeout(30)
-
             threading.Thread(
                 target=_handle_client,
                 args=(conn, addr),
