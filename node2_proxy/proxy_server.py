@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from crypto import encrypt_data, decrypt_data
 from security_manager import is_ip_allowed
+from udp_client_helper import check_spam_score 
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,15 +69,25 @@ def _proxy_smtp(client: socket.socket, server: socket.socket):
                 server.sendall(line)
                 client.sendall(_recv_line(server))
 
+            # ── AFTER (fixed code) ────────────────────────────────────────────────────
             elif cmd == "DATA":
                 server.sendall(line)
                 resp = _recv_line(server)
                 client.sendall(resp)
                 if resp.decode().startswith("354"):
-                    raw_body   = _recv_until(client, b"\r\n.\r\n")
-                    plaintext  = raw_body[:-5].decode("utf-8", errors="replace")
+                    raw_body = _recv_until(client, b"\r\n.\r\n")
+                    plaintext = raw_body[:-5].decode("utf-8", errors="replace")
+
+                    # ── SPAM CHECK ON PLAINTEXT (before any encryption) ──────────────
+                    is_spam = check_spam_score(plaintext)
+                    spam_flag = b"SPAM:YES\r\n" if is_spam else b"SPAM:NO\r\n"
+                    log.info(f"Spam check on plaintext → is_spam={is_spam}")
+                    # ─────────────────────────────────────────────────────────────────
+
                     ciphertext = encrypt_data(plaintext)
-                    server.sendall(ciphertext.encode() + b"\r\n.\r\n")
+
+                    # Prepend spam flag as first line, then ciphertext, then terminator
+                    server.sendall(spam_flag + ciphertext.encode() + b"\r\n.\r\n")
                     log.info("Email body encrypted → SMTP server.")
                     client.sendall(_recv_line(server))
 
