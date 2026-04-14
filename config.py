@@ -13,6 +13,7 @@ POP3_IP       = os.getenv("POP3_IP",    "172.18.13.91")   # Node 4 – Sunny's m
 DNS_SPAM_IP   = os.getenv("DNS_IP",     "172.18.1.42")   # Node 5 – Amit's machine
 FILE_TRANSFER_PORT = 4501   # Node 3 → Node 4 immediate push
 REGISTRATION_PORT  = 4502   # Node 4 registration server
+DELETE_PORT = 4503   # Node 4 → Node 3 deletion notification
 
 PROXY_PORT    = 8000
 SMTP_PORT     = 2525

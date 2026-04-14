@@ -1,41 +1,34 @@
-"""Keyword-based spam classifier with logging."""
+import joblib
 import os
-import datetime
-import logging
 
-log = logging.getLogger(__name__)
-
-KEYWORDS_FILE = os.path.join(os.path.dirname(__file__), "spam_keywords.txt")
-SPAM_LOG_FILE = os.path.join(os.path.dirname(__file__), "spam_log.txt")
-
-
-def _load_keywords() -> list[str]:
-    if not os.path.exists(KEYWORDS_FILE):
-        return []
-    with open(KEYWORDS_FILE, "r") as f:
-        return [line.strip().lower() for line in f if line.strip()]
-
-
-def is_spam(content: str) -> bool:
+class SpamFilterModule:
     """
-    Returns True if the content contains any spam keywords.
-    Logs detections to spam_log.txt.
+    Middleware module for scanning inbound emails in the Secure Email network.
     """
-    keywords = _load_keywords()
-    content_lower = content.lower()
+    def __init__(self, model_path='spam_logistic_model.pkl', vec_path='tfidf_vectorizer.pkl'):
+        # Check if files exist to prevent node crash on startup
+        if not os.path.exists(model_path) or not os.path.exists(vec_path):
+            raise FileNotFoundError(f"Model artifacts not found. Ensure {model_path} and {vec_path} are in the same directory.")
+            
+        print("[SpamFilter] Loading AI models into memory...")
+        self.model = joblib.load(model_path)
+        self.vectorizer = joblib.load(vec_path)
+        print("[SpamFilter] Initialized and ready.")
 
-    hits = [kw for kw in keywords if kw in content_lower]
-    if hits:
-        entry = (
-            f"[{datetime.datetime.now().isoformat()}] "
-            f"SPAM DETECTED – Keywords: {', '.join(hits)}\n"
-        )
-        try:
-            with open(SPAM_LOG_FILE, "a") as logf:
-                logf.write(entry)
-        except OSError as e:
-            log.error(f"Could not write spam log: {e}")
-        log.warning(f"Spam detected. Keywords matched: {hits}")
-        return True
-
-    return False
+    def is_spam(self, email_body_text: str) -> bool:
+        """
+        Takes raw email text, applies TF-IDF transformation, 
+        and mathematically predicts if it is Spam.
+        """
+        # Failsafe for empty emails
+        if not email_body_text or not str(email_body_text).strip():
+            return False 
+            
+        # 1. Transform text using the exact mathematical vocabulary from training
+        features = self.vectorizer.transform([str(email_body_text)])
+        
+        # 2. Predict using the balanced Logistic Regression model
+        prediction = self.model.predict(features)
+        
+        # 3. Return boolean (1 is mapped to Spam)
+        return bool(prediction[0] == 1)
