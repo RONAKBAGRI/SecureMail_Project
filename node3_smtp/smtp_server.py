@@ -3,12 +3,14 @@ Node 3 – SMTP Server / MTA (Gaurav)
 
 Handles: HELO/EHLO, MAIL FROM, RCPT TO, DATA, RSET, NOOP, QUIT
   • Verifies recipient via UDP → Node 5
-  • Checks email body for spam via UDP → Node 5
+  • Uses spam flag from Node 2 proxy (if available)
+  • Fallback: checks spam locally if no flag
   • Stores encrypted body to local disk
   • Writes metadata receipt
   • Immediately pushes email to Node 4 via TCP (file_pusher)
   • Multi-threaded
 """
+
 import socket
 import threading
 import os
@@ -91,6 +93,7 @@ def _handle_client(conn: socket.socket, addr):
                 except IndexError:
                     conn.sendall(b"501 Syntax: RCPT TO:<address>\r\n")
                     continue
+
                 if verify_user(rcpt):
                     conn.sendall(b"250 OK\r\n")
                     log.info(f"RCPT TO accepted: {rcpt}")
@@ -99,6 +102,10 @@ def _handle_client(conn: socket.socket, addr):
                     log.warning(f"RCPT TO rejected: {rcpt}")
                     rcpt = None
 
+            # ───────────────────────────────────────────────────────────────
+            # ✅ FIXED DATA HANDLING WITH PROXY SPAM FLAG
+            # ───────────────────────────────────────────────────────────────
+
             elif cmd == "DATA":
                 if not sender or not rcpt:
                     conn.sendall(b"503 Bad sequence of commands\r\n")
@@ -106,12 +113,41 @@ def _handle_client(conn: socket.socket, addr):
 
                 conn.sendall(b"354 End data with <CRLF>.<CRLF>\r\n")
 
-                raw  = _recv_until(conn, b"\r\n.\r\n")
-                body = raw[:-5].decode("utf-8", errors="replace")
+                raw = _recv_until(conn, b"\r\n.\r\n")
 
-                is_spam = check_spam_score(body)
-                folder  = "spam" if is_spam else "inbox"
+                # Remove SMTP terminator
+                raw_stripped = raw[:-5]
 
+                # Try to extract spam flag from Node 2 proxy
+                first_newline = raw_stripped.find(b"\r\n")
+
+                if first_newline != -1:
+                    flag_line = raw_stripped[:first_newline].decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+
+                    if flag_line in ("SPAM:YES", "SPAM:NO"):
+                        is_spam = (flag_line == "SPAM:YES")
+                        body = raw_stripped[first_newline + 2:].decode(
+                            "utf-8", errors="replace"
+                        )
+                        log.info(f"Spam flag from proxy: {flag_line}")
+
+                    else:
+                        # Fallback: no valid flag
+                        body = raw_stripped.decode("utf-8", errors="replace")
+                        is_spam = check_spam_score(body)
+                        log.warning("No spam flag from proxy; fallback to local check.")
+
+                else:
+                    # Edge case: no newline found
+                    body = raw_stripped.decode("utf-8", errors="replace")
+                    is_spam = check_spam_score(body)
+                    log.warning("Malformed DATA: fallback to local spam check.")
+
+                folder = "spam" if is_spam else "inbox"
+
+                # ── Store email ────────────────────────────────────────────
                 save_dir = os.path.join(config.SHARED_STORAGE_DIR, rcpt, folder)
                 os.makedirs(save_dir, exist_ok=True)
 
@@ -122,21 +158,24 @@ def _handle_client(conn: socket.socket, addr):
                     f.write(body)
 
                 meta = {
-                    "sender":    sender,
+                    "sender": sender,
                     "recipient": rcpt,
                     "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                    "status":    "Quarantined" if is_spam else "Delivered",
-                    "spam":      is_spam,
+                    "status": "Quarantined" if is_spam else "Delivered",
+                    "spam": is_spam,
                 }
+
                 generate_receipt(filepath, sender, rcpt, is_spam)
 
-                # ── Push to Node 4 immediately ────────────────────
+                # ── Push to Node 4 ────────────────────────────────────────
                 push_email(rcpt, folder, filename, body, meta)
 
                 log.info(f"Stored + pushed: {filepath} | spam={is_spam}")
                 conn.sendall(b"250 Message accepted for delivery\r\n")
 
                 sender, rcpt = None, None
+
+            # ───────────────────────────────────────────────────────────────
 
             elif cmd == "RSET":
                 sender, rcpt = None, None
@@ -174,17 +213,20 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((LISTEN_IP, config.SMTP_PORT))
     srv.listen(10)
+
     log.info(f"SMTP Server listening on {LISTEN_IP}:{config.SMTP_PORT}")
 
     try:
         while True:
             conn, addr = srv.accept()
             conn.settimeout(30)
+
             threading.Thread(
                 target=_handle_client,
                 args=(conn, addr),
                 daemon=True
             ).start()
+
     except KeyboardInterrupt:
         log.info("SMTP Server shutting down.")
     finally:
