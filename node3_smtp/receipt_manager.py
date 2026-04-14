@@ -1,44 +1,28 @@
+
+import json
 import os
-import time
-import sys
+import datetime
+import logging
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import config
+log = logging.getLogger(__name__)
 
-def generate_read_receipt(sender_email, receiver_email):
+
+def generate_receipt(email_filepath: str, sender: str, recipient: str, is_spam: bool = False):
     """
-    Generates an automated system email notifying the sender 
-    that their message was read.
+    Write a .meta file next to the .enc email file.
+    Fields: sender, recipient, timestamp, status, spam.
     """
-    print(f"[*] Generating Read Receipt for {sender_email}...")
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    
-    receipt_body = (
-        f"Subject: Read Receipt: Your email to {receiver_email}\n"
-        f"From: system@projectmail.local\n"
-        f"To: {sender_email}\n"
-        f"X-System-Automated: yes\n\n"
-        f"This is an automated notification.\n"
-        f"Your email to {receiver_email} was successfully opened and read on {timestamp}."
-    )
-    
-    # Extract the username (e.g., "prashant" from "prashant@projectmail.local")
-    username = sender_email.split('@')[0]
-    
-    # Define where this receipt gets saved
-    user_inbox_dir = os.path.join(config.STORAGE_DIR, username, "inbox")
-    
-    # Ensure the directory exists
-    os.makedirs(user_inbox_dir, exist_ok=True)
-    
-    filename = f"receipt_{int(time.time())}.txt"
-    filepath = os.path.join(user_inbox_dir, filename)
-    
+    meta_path = email_filepath.replace(".enc", ".meta")
+    data = {
+        "sender":    sender,
+        "recipient": recipient,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "status":    "Quarantined" if is_spam else "Delivered",
+        "spam":      is_spam,
+    }
     try:
-        with open(filepath, 'w') as f:
-            f.write(receipt_body)
-        print(f"[+] Read receipt successfully placed in {username}'s inbox.")
-        return True
-    except Exception as e:
-        print(f"[!] Failed to write read receipt: {e}")
-        return False
+        with open(meta_path, "w") as f:
+            json.dump(data, f, indent=2)
+        log.debug(f"Receipt written: {meta_path}")
+    except OSError as e:
+        log.error(f"Could not write receipt: {e}")

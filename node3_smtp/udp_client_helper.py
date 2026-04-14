@@ -1,48 +1,69 @@
+"""UDP client helpers for querying Node 5 (DNS + Spam Filter)."""
+
 import socket
+import json
 import sys
 import os
+import logging
+from typing import Optional  # ✅ FIX: for Python < 3.10
 
-# Ensure we can read config.py from the parent directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add parent directory to path (to import config)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
-def ask_amit(message):
-    """Sends a UDP packet to Node 5 and waits for a response."""
+log = logging.getLogger(__name__)
+
+UDP_TIMEOUT = 3.0
+
+
+def _udp_query(payload: dict) -> Optional[dict]:
+    """
+    Send a JSON query to Node 5 and return the parsed response.
+    Returns None if timeout or error occurs.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(UDP_TIMEOUT)
+
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0) # Don't hang forever if Amit's server is down
-        sock.sendto(message.encode('utf-8'), (config.UDP_DNS_IP, config.UDP_DNS_PORT))
-        
-        data, _ = sock.recvfrom(1024)
-        return data.decode('utf-8')
+        data = json.dumps(payload).encode()
+        sock.sendto(data, (config.DNS_SPAM_IP, config.DNS_SPAM_PORT))
+
+        resp, _ = sock.recvfrom(4096)
+        return json.loads(resp.decode())
+
     except socket.timeout:
-        print("[!] Timeout: Amit's UDP server did not respond.")
-        return "ERROR_TIMEOUT"
+        log.warning(f"[UDP] Node 5 timed out for query: {payload.get('action')}")
+        return None
+
     except Exception as e:
-        print(f"[!] UDP Error: {e}")
-        return "ERROR"
+        log.error(f"[UDP] Query error: {e}")
+        return None
 
-def verify_user(email_address):
-    """Asks Node 5 if the recipient exists."""
-    print(f"[*] Verifying user {email_address} with Node 5...")
-    response = ask_amit(f"VERIFY:{email_address}")
-    
-    # Assuming Amit replies with "VALID" or "INVALID"
-    if "VALID" in response.upper() and "INVALID" not in response.upper():
-        return True
-    return False
+    finally:
+        sock.close()
 
-def check_spam(email_body):
-    """Sends a snippet of the email body to Node 5 for spam scoring."""
-    print("[*] Sending payload to Node 5 for Spam Check...")
-    # Send only the first 500 characters to avoid massive UDP packets
-    snippet = email_body[:500] 
-    response = ask_amit(f"SPAM_CHECK:{snippet}")
-    
-    # Assuming Amit replies with something like "SPAM:85" or "CLEAN:10"
-    if "SPAM" in response.upper():
-        print(f"[!] Spam detected by Node 5: {response}")
-        return True
-    
-    print("[*] Payload marked as CLEAN.")
-    return False
+
+def verify_user(email: str) -> bool:
+    """
+    Return True if the email address is registered in Node 5.
+    """
+    resp = _udp_query({"action": "VERIFY", "email": email})
+
+    if resp is None:
+        log.warning("[UDP] VERIFY timed out; defaulting to REJECT.")
+        return False
+
+    return resp.get("status") == "OK"
+
+
+def check_spam_score(content: str) -> bool:
+    """
+    Return True if the content is classified as spam by Node 5.
+    """
+    resp = _udp_query({"action": "SPAM_CHECK", "content": content})
+
+    if resp is None:
+        log.warning("[UDP] SPAM_CHECK timed out; defaulting to NOT spam.")
+        return False
+
+    return bool(resp.get("is_spam", False))

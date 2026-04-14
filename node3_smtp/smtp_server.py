@@ -1,127 +1,195 @@
+"""
+Node 3 – SMTP Server / MTA (Gaurav)
+
+Handles: HELO/EHLO, MAIL FROM, RCPT TO, DATA, RSET, NOOP, QUIT
+  • Verifies recipient via UDP → Node 5
+  • Checks email body for spam via UDP → Node 5
+  • Stores encrypted body to local disk
+  • Writes metadata receipt
+  • Immediately pushes email to Node 4 via TCP (file_pusher)
+  • Multi-threaded
+"""
 import socket
 import threading
 import os
 import time
+import datetime
 import sys
+import logging
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from udp_client_helper import verify_user, check_spam_score
+from receipt_manager import generate_receipt
+from file_pusher import push_email
 
-# Import your helper functions
-from udp_client_helper import verify_user, check_spam
-from receipt_manager import generate_read_receipt
+logging.basicConfig(
+    level=logging.INFO,
+    format="[NODE3-SMTP][%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
 
-def handle_client(conn, addr):
-    print(f"[+] Proxy connected from {addr}")
-    conn.send(b"220 projectmail.local SMTP Service Ready\r\n")
-    
-    # Session state variables
-    sender = ""
-    recipient = ""
-    recipient_username = ""
-    is_data_mode = False
-    email_payload = []
-    
+LISTEN_IP = "0.0.0.0"
+MAX_BODY  = 10 * 1024 * 1024
+
+
+# ── Socket helpers ────────────────────────────────────────────────────────────
+
+def _recv_line(sock: socket.socket) -> str:
+    buf = b""
+    while not buf.endswith(b"\r\n"):
+        ch = sock.recv(1)
+        if not ch:
+            raise ConnectionError("Client disconnected")
+        buf += ch
+    return buf.decode("utf-8", errors="replace").rstrip("\r\n")
+
+
+def _recv_until(sock: socket.socket, terminator: bytes, max_size: int = MAX_BODY) -> bytes:
+    buf = b""
+    while not buf.endswith(terminator):
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("Client disconnected mid-body")
+        buf += chunk
+        if len(buf) > max_size:
+            raise OverflowError("Body too large")
+    return buf
+
+
+# ── Per-connection handler ────────────────────────────────────────────────────
+
+def _handle_client(conn: socket.socket, addr):
+    sender, rcpt = None, None
     try:
+        conn.sendall(b"220 SecureMail SMTP Ready\r\n")
+        log.info(f"Connection from {addr[0]}")
+
         while True:
-            if is_data_mode:
-                # In DATA mode, read chunks until we see the termination sequence: \r\n.\r\n
-                chunk = conn.recv(4096).decode('utf-8', errors='ignore')
-                if not chunk: break
-                
-                email_payload.append(chunk)
-                full_data = "".join(email_payload)
-                
-                if "\r\n.\r\n" in full_data:
-                    # End of email payload detected
-                    email_body = full_data.split("\r\n.\r\n")[0]
-                    
-                    # 1. Ask Amit if it's spam
-                    is_spam = check_spam(email_body)
-                    folder = "spam" if is_spam else "inbox"
-                    
-                    # 2. Save the file
-                    user_dir = os.path.join(config.STORAGE_DIR, recipient_username, folder)
-                    os.makedirs(user_dir, exist_ok=True)
-                    
-                    filename = f"mail_{int(time.time())}.txt"
-                    filepath = os.path.join(user_dir, filename)
-                    
-                    with open(filepath, 'w') as f:
-                        f.write(email_body)
-                        
-                    print(f"[+] Email saved to {filepath}")
-                    conn.send(b"250 Message accepted for delivery\r\n")
-                    
-                    # Reset state for the next email in this session
-                    is_data_mode = False
-                    email_payload = []
-            else:
-                # Normal command mode
-                line = conn.recv(1024).decode('utf-8').strip()
-                if not line: break
-                
-                print(f" [Client] {line}")
-                cmd = line[:4].upper()
-                
-                if cmd in ["EHLO", "HELO"]:
-                    conn.send(b"250 Hello\r\n")
-                    
-                elif cmd == "MAIL": # MAIL FROM:<sender>
-                    sender = line.split("<")[1].split(">")[0] if "<" in line else line.split(":")[1].strip()
-                    conn.send(b"250 OK\r\n")
-                    
-                elif cmd == "RCPT": # RCPT TO:<receiver>
-                    recipient = line.split("<")[1].split(">")[0] if "<" in line else line.split(":")[1].strip()
-                    
-                    # Ask Amit if user exists via UDP
-                    if verify_user(recipient):
-                        recipient_username = recipient.split("@")[0]
-                        conn.send(b"250 OK\r\n")
-                    else:
-                        conn.send(b"550 No such user here\r\n")
-                        
-                elif cmd == "DATA":
-                    conn.send(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
-                    is_data_mode = True
-                    
-                elif cmd == "NOTI": 
-                    # Custom Command: NOTIFY_READ sender@mail.com receiver@mail.com
-                    # Sunny's POP3 server will hit this when an email is fetched.
-                    parts = line.split()
-                    if len(parts) == 3:
-                        generate_read_receipt(sender_email=parts[1], receiver_email=parts[2])
-                        conn.send(b"250 Read receipt queued\r\n")
-                    else:
-                        conn.send(b"500 Syntax error in NOTIFY command\r\n")
-                        
-                elif cmd == "QUIT":
-                    conn.send(b"221 projectmail.local Service closing transmission channel\r\n")
-                    break
-                    
+            line = _recv_line(conn)
+            if not line:
+                continue
+
+            cmd = line.upper().split()[0] if line.split() else ""
+            log.debug(f"  C: {line}")
+
+            if cmd in ("HELO", "EHLO"):
+                conn.sendall(b"250 Hello. SecureMail SMTP at your service.\r\n")
+
+            elif cmd == "MAIL":
+                try:
+                    sender = line.split(":<", 1)[1].rstrip(">").strip()
+                except IndexError:
+                    conn.sendall(b"501 Syntax: MAIL FROM:<address>\r\n")
+                    continue
+                conn.sendall(b"250 OK\r\n")
+                log.info(f"MAIL FROM: {sender}")
+
+            elif cmd == "RCPT":
+                try:
+                    rcpt = line.split(":<", 1)[1].rstrip(">").strip()
+                except IndexError:
+                    conn.sendall(b"501 Syntax: RCPT TO:<address>\r\n")
+                    continue
+                if verify_user(rcpt):
+                    conn.sendall(b"250 OK\r\n")
+                    log.info(f"RCPT TO accepted: {rcpt}")
                 else:
-                    conn.send(b"500 Command unrecognized\r\n")
-                    
+                    conn.sendall(b"550 No such user here\r\n")
+                    log.warning(f"RCPT TO rejected: {rcpt}")
+                    rcpt = None
+
+            elif cmd == "DATA":
+                if not sender or not rcpt:
+                    conn.sendall(b"503 Bad sequence of commands\r\n")
+                    continue
+
+                conn.sendall(b"354 End data with <CRLF>.<CRLF>\r\n")
+
+                raw  = _recv_until(conn, b"\r\n.\r\n")
+                body = raw[:-5].decode("utf-8", errors="replace")
+
+                is_spam = check_spam_score(body)
+                folder  = "spam" if is_spam else "inbox"
+
+                save_dir = os.path.join(config.SHARED_STORAGE_DIR, rcpt, folder)
+                os.makedirs(save_dir, exist_ok=True)
+
+                filename = f"{int(time.time() * 1000)}.enc"
+                filepath = os.path.join(save_dir, filename)
+
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(body)
+
+                meta = {
+                    "sender":    sender,
+                    "recipient": rcpt,
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "status":    "Quarantined" if is_spam else "Delivered",
+                    "spam":      is_spam,
+                }
+                generate_receipt(filepath, sender, rcpt, is_spam)
+
+                # ── Push to Node 4 immediately ────────────────────
+                push_email(rcpt, folder, filename, body, meta)
+
+                log.info(f"Stored + pushed: {filepath} | spam={is_spam}")
+                conn.sendall(b"250 Message accepted for delivery\r\n")
+
+                sender, rcpt = None, None
+
+            elif cmd == "RSET":
+                sender, rcpt = None, None
+                conn.sendall(b"250 OK\r\n")
+
+            elif cmd == "NOOP":
+                conn.sendall(b"250 OK\r\n")
+
+            elif cmd == "QUIT":
+                conn.sendall(b"221 Bye\r\n")
+                break
+
+            else:
+                conn.sendall(b"500 Command not recognized\r\n")
+
+    except ConnectionError as e:
+        log.warning(f"Client {addr[0]} disconnected: {e}")
+    except OverflowError:
+        log.warning(f"Client {addr[0]} sent oversized body.")
+        try:
+            conn.sendall(b"552 Message too large\r\n")
+        except Exception:
+            pass
     except Exception as e:
-        print(f"[!] Connection error: {e}")
+        log.error(f"Error handling {addr}: {e}", exc_info=True)
     finally:
         conn.close()
-        print(f"[-] Connection closed with {addr}")
+        log.info(f"Connection from {addr[0]} closed.")
 
-def start_smtp():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Allow port reuse so you don't get "Address already in use" errors during rapid testing
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) 
-    server.bind((config.SMTP_IP, config.SMTP_PORT))
-    server.listen(5)
-    
-    print(f"[*] Gaurav's SMTP Server listening on {config.SMTP_IP}:{config.SMTP_PORT}")
-    
-    while True:
-        client_conn, addr = server.accept()
-        # Handle each incoming email in a new thread so the server doesn't freeze
-        client_thread = threading.Thread(target=handle_client, args=(client_conn, addr))
-        client_thread.start()
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((LISTEN_IP, config.SMTP_PORT))
+    srv.listen(10)
+    log.info(f"SMTP Server listening on {LISTEN_IP}:{config.SMTP_PORT}")
+
+    try:
+        while True:
+            conn, addr = srv.accept()
+            conn.settimeout(30)
+            threading.Thread(
+                target=_handle_client,
+                args=(conn, addr),
+                daemon=True
+            ).start()
+    except KeyboardInterrupt:
+        log.info("SMTP Server shutting down.")
+    finally:
+        srv.close()
+
 
 if __name__ == "__main__":
-    start_smtp()
+    main()
