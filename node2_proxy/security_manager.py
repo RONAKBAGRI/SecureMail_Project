@@ -1,22 +1,21 @@
 import os
+import logging
 
-def is_sender_allowed(sender_email):
-    """
-    Checks if an email is in the blacklist. 
-    Returns True if allowed, False if blocked.
-    """
-    # Clean up the email string (removes whitespace and < > brackets common in SMTP)
-    clean_email = sender_email.strip("<> \r\n")
-    
-    blacklist_path = os.path.join(os.path.dirname(__file__), "blacklist.txt")
-    
-    if os.path.exists(blacklist_path):
-        with open(blacklist_path, "r") as f:
-            # Read non-empty lines
-            blacklisted_emails = [line.strip() for line in f.readlines() if line.strip()]
-            
-            if clean_email in blacklisted_emails:
-                print(f"[SECURITY ALERT] Dropped connection from blacklisted sender: {clean_email}")
-                return False
-                
-    return True
+log = logging.getLogger(__name__)
+BLACKLIST_FILE = os.path.join(os.path.dirname(__file__), "blacklist.txt")
+
+
+def is_ip_allowed(ip_address: str) -> bool:
+    """Return True if the IP is NOT on the blacklist."""
+    if not os.path.exists(BLACKLIST_FILE):
+        return True
+    try:
+        with open(BLACKLIST_FILE, "r") as f:
+            blocked = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+        if ip_address in blocked:
+            log.warning(f"[SECURITY] Blocked connection from blacklisted IP: {ip_address}")
+            return False
+        return True
+    except OSError as e:
+        log.error(f"[SECURITY] Could not read blacklist: {e}")
+        return True  # Fail open

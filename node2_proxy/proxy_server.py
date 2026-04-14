@@ -1,152 +1,244 @@
+"""
+Node 2 – Proxy Server (Ronak)
+
+Routes:
+  ROUTE:SMTP     → Node 3 port 2525  (with body encryption)
+  ROUTE:POP3     → Node 4 port 1100  (with body decryption)
+  ROUTE:REGISTER → Node 4 port 4502  (plain passthrough)
+"""
 import socket
 import threading
 import sys
 import os
+import logging
 
-# Add parent directory to path so we can import config.py
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from crypto import encrypt_data, decrypt_data
+from security_manager import is_ip_allowed
 
-from security_manager import is_sender_allowed
-from crypto import encrypt_payload, decrypt_payload
+logging.basicConfig(
+    level=logging.INFO,
+    format="[NODE2-PROXY][%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
 
-def handle_client(client_socket, client_addr):
-    """Handles an individual connection from Prashant's GUI."""
-    print(f"\n[+] Incoming connection from Client: {client_addr}")
-    
+LISTEN_IP  = config.PROXY_IP
+BUFFER    = 4096
+MAX_BODY  = 10 * 1024 * 1024
+
+
+# ── Socket helpers ────────────────────────────────────────────────────────────
+
+def _recv_line(sock: socket.socket) -> bytes:
+    buf = b""
+    while not buf.endswith(b"\r\n"):
+        ch = sock.recv(1)
+        if not ch:
+            raise ConnectionError("Socket closed")
+        buf += ch
+    return buf
+
+
+def _recv_until(sock: socket.socket, terminator: bytes, max_size: int = MAX_BODY) -> bytes:
+    buf = b""
+    while not buf.endswith(terminator):
+        chunk = sock.recv(BUFFER)
+        if not chunk:
+            raise ConnectionError("Socket closed mid-stream")
+        buf += chunk
+        if len(buf) > max_size:
+            raise OverflowError("Payload too large")
+    return buf
+
+
+# ── Protocol handlers ─────────────────────────────────────────────────────────
+
+def _proxy_smtp(client: socket.socket, server: socket.socket):
+    """Forward SMTP, encrypting the email body before it reaches Node 3."""
     try:
-        # Read the first packet to determine routing and check security
-        initial_data = client_socket.recv(4096)
-        if not initial_data:
-            client_socket.close()
-            return
-            
-        decoded_data = initial_data.decode('utf-8', errors='ignore')
-        print(f"[PROXY INTERCEPT] Initial Payload:\n{decoded_data.strip()}")
+        client.sendall(_recv_line(server))   # forward 220 banner
 
-        # ---------------------------------------------------------
-        # 1. SECURITY CHECK (Blacklist Enforcement)
-        # ---------------------------------------------------------
-        if "MAIL FROM:" in decoded_data.upper():
-            # Extract the email address from the command
-            parts = decoded_data.upper().split("MAIL FROM:")
-            if len(parts) > 1:
-                sender = parts[1].split()[0] # Grab the email part
-                if not is_sender_allowed(sender):
-                    # Actively reject the connection!
-                    client_socket.send(b"550 Requested action not taken: mailbox unavailable (Blacklisted)\r\n")
-                    client_socket.close()
-                    return
-
-        # ---------------------------------------------------------
-        # 2. ROUTING & ENCRYPTION ENGINE
-        # ---------------------------------------------------------
-        # If the packet looks like SMTP (Sending mail)
-        if "EHLO" in decoded_data.upper() or "HELO" in decoded_data.upper() or "SMTP" in decoded_data.upper():
-            print(f"[*] Routing {client_addr} to Gaurav (SMTP MTA)")
-            
-            # Encrypt the payload before sending to Gaurav
-            # (In a real system we'd parse the DATA block, but for the project we encrypt the whole message body if we detect it)
-            if "DATA_BODY:" in decoded_data:
-                # Assuming Prashant formats his final message with a specific tag for easy parsing
-                parts = decoded_data.split("DATA_BODY:")
-                header = parts[0]
-                body = parts[1]
-                encrypted_body = encrypt_payload(body)
-                modified_data = (header + "DATA_BODY:" + encrypted_body).encode('utf-8')
-            else:
-                modified_data = initial_data
-
-            forward_traffic(client_socket, modified_data, config.SMTP_IP, config.SMTP_PORT)
-
-        # If the packet looks like POP3 (Fetching mail)
-        elif "USER" in decoded_data.upper() or "POP3" in decoded_data.upper():
-            print(f"[*] Routing {client_addr} to Sunny (POP3 MAA)")
-            # We don't encrypt on the way TO Sunny, we decrypt on the way BACK.
-            forward_traffic(client_socket, initial_data, config.POP3_IP, config.POP3_PORT, decrypt_return=True)
-            
-        else:
-            print(f"[!] Unknown protocol signature from {client_addr}. Dropping.")
-            client_socket.send(b"ERROR: Unknown Protocol Signature\r\n")
-            client_socket.close()
-
-    except Exception as e:
-        print(f"[!] Proxy Error handling client: {e}")
-        client_socket.close()
-
-
-def forward_traffic(client_socket, initial_data, target_ip, target_port, decrypt_return=False):
-    """Acts as a middleman, passing data between Client and Server."""
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        server_socket.connect((target_ip, target_port))
-        
-        # Send the initial data we intercepted
-        server_socket.send(initial_data)
-        
-        # Set up a continuous bidirectional bridge
-        # Thread 1: Client -> Proxy -> Server
-        c2s = threading.Thread(target=bridge, args=(client_socket, server_socket, False))
-        # Thread 2: Server -> Proxy -> Client
-        s2c = threading.Thread(target=bridge, args=(server_socket, client_socket, decrypt_return))
-        
-        c2s.start()
-        s2c.start()
-        
-    except ConnectionRefusedError:
-        print(f"[!] Cannot reach target Server at {target_ip}:{target_port}. Is it running?")
-        client_socket.send(b"503 Service Unavailable\r\n")
-        client_socket.close()
-
-def bridge(source, destination, apply_decryption):
-    """Continuously reads from source and sends to destination."""
-    try:
         while True:
-            data = source.recv(4096)
-            if not data:
+            line       = _recv_line(client)
+            first_word = line.decode("utf-8", errors="replace").strip().upper().split()
+            cmd        = first_word[0] if first_word else ""
+
+            if cmd in ("HELO", "EHLO", "MAIL", "RCPT", "NOOP", "RSET"):
+                server.sendall(line)
+                client.sendall(_recv_line(server))
+
+            elif cmd == "DATA":
+                server.sendall(line)
+                resp = _recv_line(server)
+                client.sendall(resp)
+                if resp.decode().startswith("354"):
+                    raw_body   = _recv_until(client, b"\r\n.\r\n")
+                    plaintext  = raw_body[:-5].decode("utf-8", errors="replace")
+                    ciphertext = encrypt_data(plaintext)
+                    server.sendall(ciphertext.encode() + b"\r\n.\r\n")
+                    log.info("Email body encrypted → SMTP server.")
+                    client.sendall(_recv_line(server))
+
+            elif cmd == "QUIT":
+                server.sendall(line)
+                try:
+                    client.sendall(_recv_line(server))
+                except ConnectionError:
+                    pass
                 break
-                
-            if apply_decryption:
-                decoded = data.decode('utf-8', errors='ignore')
-                if "DATA_BODY:" in decoded:
-                    # If fetching from Sunny, decrypt it before giving it to Prashant
-                    parts = decoded.split("DATA_BODY:")
-                    header = parts[0]
-                    encrypted_body = parts[1]
-                    decrypted_body = decrypt_payload(encrypted_body)
-                    data = (header + "DATA_BODY:" + decrypted_body).encode('utf-8')
 
-            destination.send(data)
-    except Exception:
-        pass # Expected when sockets close naturally
-    finally:
-        source.close()
-        destination.close()
+            else:
+                server.sendall(line)
+                try:
+                    client.sendall(_recv_line(server))
+                except ConnectionError:
+                    break
+
+    except ConnectionError as e:
+        log.debug(f"SMTP proxy ended: {e}")
 
 
-def start_proxy():
-    proxy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Allow port reuse so you don't get "Address already in use" errors while testing
-    proxy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
+def _proxy_pop3(client: socket.socket, server: socket.socket):
+    """Forward POP3, decrypting email bodies before they reach the client."""
     try:
-        proxy.bind((config.PROXY_IP, config.PROXY_PORT))
-        proxy.listen(10)
-        print("="*50)
-        print(f"[*] Ronak's Reverse Proxy & Security Node Active")
-        print(f"[*] Listening on {config.PROXY_IP}:{config.PROXY_PORT}")
-        print("="*50)
+        client.sendall(_recv_line(server))   # forward +OK banner
 
         while True:
-            client_socket, addr = proxy.accept()
-            # Handle each client in a new thread so multiple clients can connect at once
-            client_thread = threading.Thread(target=handle_client, args=(client_socket, addr))
-            client_thread.start()
-            
+            line  = _recv_line(client)
+            parts = line.decode("utf-8", errors="replace").strip().upper().split()
+            cmd   = parts[0] if parts else ""
+
+            if cmd in ("USER", "PASS", "STAT", "DELE", "NOOP", "RSET"):
+                server.sendall(line)
+                client.sendall(_recv_line(server))
+
+            elif cmd == "RETR":
+                server.sendall(line)
+                raw = _recv_until(server, b"\r\n.\r\n")
+                if raw.startswith(b"+OK"):
+                    header_end     = raw.index(b"\r\n") + 2
+                    status_line    = raw[:header_end]
+                    encrypted_body = raw[header_end:-5].decode("utf-8", errors="replace")
+                    plaintext      = decrypt_data(encrypted_body)
+                    client.sendall(status_line + plaintext.encode("utf-8") + b"\r\n.\r\n")
+                    log.info("Email body decrypted → client.")
+                else:
+                    client.sendall(raw)
+
+            elif cmd == "LIST":
+                server.sendall(line)
+                if len(parts) > 1:
+                    client.sendall(_recv_line(server))
+                else:
+                    client.sendall(_recv_until(server, b"\r\n.\r\n"))
+
+            elif cmd == "QUIT":
+                server.sendall(line)
+                try:
+                    client.sendall(_recv_line(server))
+                except ConnectionError:
+                    pass
+                break
+
+            else:
+                server.sendall(line)
+                try:
+                    client.sendall(_recv_line(server))
+                except ConnectionError:
+                    break
+
+    except ConnectionError as e:
+        log.debug(f"POP3 proxy ended: {e}")
+
+
+def _proxy_register(client: socket.socket, server: socket.socket):
+    """
+    Single round-trip passthrough for user registration.
+    Client sends one REGISTER line, server responds with +OK or -ERR.
+    No encryption needed.
+    """
+    try:
+        line = _recv_line(client)    # REGISTER <email> <password>\r\n
+        server.sendall(line)
+        resp = _recv_line(server)    # +OK … or -ERR …
+        client.sendall(resp)
+    except ConnectionError as e:
+        log.debug(f"REGISTER proxy ended: {e}")
+
+
+# ── Connection dispatcher ─────────────────────────────────────────────────────
+
+def _handle_connection(client_sock: socket.socket, addr):
+    server_sock = None
+    try:
+        if not is_ip_allowed(addr[0]):
+            client_sock.sendall(b"550 Access denied.\r\n")
+            return
+
+        route = _recv_line(client_sock).decode("utf-8", errors="replace").strip()
+        log.info(f"Connection from {addr[0]} | Route: {route}")
+
+        if route == "ROUTE:SMTP":
+            target  = (config.SMTP_IP, config.SMTP_PORT)
+            handler = _proxy_smtp
+        elif route == "ROUTE:POP3":
+            target  = (config.POP3_IP, config.POP3_PORT)
+            handler = _proxy_pop3
+        elif route == "ROUTE:REGISTER":
+            target  = (config.POP3_IP, config.REGISTRATION_PORT)
+            handler = _proxy_register
+        else:
+            log.warning(f"Unknown route from {addr[0]}: {route!r}")
+            client_sock.sendall(b"500 Unknown route.\r\n")
+            return
+
+        client_sock.sendall(b"READY\r\n")
+
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.settimeout(30)
+        server_sock.connect(target)
+        log.info(f"Tunnel {addr[0]} → {target[0]}:{target[1]}")
+
+        handler(client_sock, server_sock)
+
+    except ConnectionRefusedError as e:
+        log.error(f"Backend unreachable: {e}")
     except Exception as e:
-        print(f"[!] Critical Proxy Error: {e}")
+        log.error(f"Error for {addr}: {e}", exc_info=True)
     finally:
-        proxy.close()
+        if server_sock:
+            server_sock.close()
+        client_sock.close()
+        log.info(f"Connection from {addr[0]} closed.")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((LISTEN_IP, config.PROXY_PORT))
+    srv.listen(20)
+    log.info(f"Proxy listening on {LISTEN_IP}:{config.PROXY_PORT}")
+    log.info(f"  SMTP     → {config.SMTP_IP}:{config.SMTP_PORT}")
+    log.info(f"  POP3     → {config.POP3_IP}:{config.POP3_PORT}")
+    log.info(f"  REGISTER → {config.POP3_IP}:{config.REGISTRATION_PORT}")
+
+    try:
+        while True:
+            client, addr = srv.accept()
+            client.settimeout(30)
+            threading.Thread(
+                target=_handle_connection,
+                args=(client, addr),
+                daemon=True
+            ).start()
+    except KeyboardInterrupt:
+        log.info("Proxy shutting down.")
+    finally:
+        srv.close()
+
 
 if __name__ == "__main__":
-    start_proxy()
+    main()

@@ -1,9 +1,8 @@
-# Ignore all __pycache__ folders anywhere
 __pycache__/
-**/__pycache__/
-
-# Ignore Python compiled files
 *.pyc
-
-# Ignore specific file
-packages.microsoft.gpg
+*.pyo
+venv/
+.env
+node2_proxy/secret.key
+node5_dns_spam/spam_log.txt
+storage/

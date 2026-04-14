@@ -1,37 +1,39 @@
-from cryptography.fernet import Fernet
+"""
+Fernet (AES-128-CBC + HMAC-SHA256) encryption module.
+The secret key is generated once and stored in secret.key.
+All nodes that need to encrypt/decrypt must share this file.
+"""
 import os
+import logging
+from cryptography.fernet import Fernet, InvalidToken
 
+log = logging.getLogger(__name__)
 KEY_FILE = os.path.join(os.path.dirname(__file__), "secret.key")
 
-def load_or_generate_key():
-    """Generates a secure key if it doesn't exist, otherwise loads it."""
+
+def _load_or_create_key() -> bytes:
     if not os.path.exists(KEY_FILE):
-        print("[*] Generating new encryption key...")
         key = Fernet.generate_key()
-        with open(KEY_FILE, "wb") as key_file:
-            key_file.write(key)
-    else:
-        with open(KEY_FILE, "rb") as key_file:
-            key = key_file.read()
-    return key
+        with open(KEY_FILE, "wb") as f:
+            f.write(key)
+        log.info(f"[CRYPTO] New encryption key generated: {KEY_FILE}")
+    with open(KEY_FILE, "rb") as f:
+        return f.read()
 
-# Initialize the cipher globally so it's ready to use
-cipher = Fernet(load_or_generate_key())
 
-def encrypt_payload(text):
-    """Takes a plain text string and returns an encrypted string."""
+_cipher = Fernet(_load_or_create_key())
+
+
+def encrypt_data(plaintext: str) -> str:
+    """Encrypt a UTF-8 string; returns a URL-safe base64 token string."""
+    return _cipher.encrypt(plaintext.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_data(token: str) -> str:
+    """Decrypt a Fernet token string; returns plaintext or original on failure."""
     try:
-        encrypted_bytes = cipher.encrypt(text.encode('utf-8'))
-        return encrypted_bytes.decode('utf-8')
-    except Exception as e:
-        print(f"[!] Encryption Error: {e}")
-        return text
-
-def decrypt_payload(encrypted_text):
-    """Takes an encrypted string and returns the plain text."""
-    try:
-        decrypted_bytes = cipher.decrypt(encrypted_text.encode('utf-8'))
-        return decrypted_bytes.decode('utf-8')
-    except Exception as e:
-        print(f"[!] Decryption Error: {e}")
-        return encrypted_text
+        return _cipher.decrypt(token.encode("utf-8")).decode("utf-8")
+    except (InvalidToken, Exception) as e:
+        log.warning(f"[CRYPTO] Decryption failed ({e}); returning raw data.")
+        return token  # Graceful fallback
+    
