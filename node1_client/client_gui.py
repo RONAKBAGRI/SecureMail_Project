@@ -3,12 +3,17 @@ Node 1 – SecureMail GUI (Prashant)
 ====================================
 Flow: LoginScreen → MainApp → (logout) → LoginScreen
 
-New features in this version:
-  • Spam tab   – fetches from the spam folder on Node 4
-  • Offline cache – emails loaded from local JSON cache on login;
-                    cache updated on every successful network Refresh
-  • Reply      – pre-fills Compose from selected email's From/Subject
-  • Delete     – removes from GUI, local cache, Node 4 storage, Node 3 storage
+Features in this version:
+  • Spam tab          – fetches from the spam folder on Node 4
+  • Offline cache     – emails loaded from local JSON cache on login;
+                        cache updated on every successful network Refresh
+  • Reply             – pre-fills Compose with correct In-Reply-To header
+                        so the reply is properly threaded on delivery
+  • Threaded view     – replies shown indented below their parent email,
+                        Gmail-style conversation grouping
+  • Sent tab          – local-only; loads instantly from Sent cache on login
+  • CC / BCC fields   – full multi-recipient support in Compose
+  • Delete            – removes from GUI, local cache, Node 4, Node 3
 """
 
 import tkinter as tk
@@ -22,7 +27,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tcp_smtp_sender  import send_email
 from tcp_pop3_fetcher import fetch_emails, delete_email
 from auth_client      import register_user
-from local_cache      import save_cache, load_cache, delete_from_cache
+from local_cache      import (
+    save_cache, load_cache, delete_from_cache,
+    append_sent, load_sent,
+)
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 BG     = "#0d1117"
@@ -35,11 +43,13 @@ YELLOW = "#d29922"
 ORANGE = "#e3b341"
 WHITE  = "#e6edf3"
 MUTED  = "#8b949e"
+THREAD = "#21262d"   # background tint for threaded replies
 
 FONT   = ("TkDefaultFont", 10)
 FONT_B = ("TkDefaultFont", 10, "bold")
 FONT_H = ("TkDefaultFont", 15, "bold")
 FONT_S = ("TkDefaultFont", 9)
+FONT_I = ("TkDefaultFont", 9, "italic")
 
 
 # ── Widget factories ──────────────────────────────────────────────────────────
@@ -66,27 +76,80 @@ def _btn(parent, text, cmd, fg=WHITE, bg=None):
 # ── Email parsing helpers ─────────────────────────────────────────────────────
 
 def _parse_headers(raw: str) -> dict:
-    """Extract From, To, and Subject from a raw email string."""
-    headers = {"from": "", "to": "", "subject": ""}
+    """Extract common headers from a raw email string."""
+    headers = {
+        "from": "", "to": "", "cc": "",
+        "subject": "", "message_id": "", "in_reply_to": "",
+    }
     for line in raw.replace("\r\n", "\n").split("\n"):
         low = line.lower()
         if low.startswith("from:"):
             headers["from"] = line[5:].strip()
         elif low.startswith("to:"):
             headers["to"] = line[3:].strip()
+        elif low.startswith("cc:"):
+            headers["cc"] = line[3:].strip()
         elif low.startswith("subject:"):
             headers["subject"] = line[8:].strip()
+        elif low.startswith("message-id:"):
+            headers["message_id"] = line[11:].strip()
+        elif low.startswith("in-reply-to:"):
+            headers["in_reply_to"] = line[12:].strip()
         elif not line.strip():
             break  # end of header block
     return headers
 
 
+def _body_only(raw: str) -> str:
+    """Return only the body portion of a raw email (after the blank header line)."""
+    sep = "\r\n\r\n" if "\r\n\r\n" in raw else "\n\n"
+    parts = raw.split(sep, 1)
+    return parts[1] if len(parts) > 1 else raw
+
+
 def _list_preview(email: dict) -> str:
     """One-line summary for the email list panel."""
-    h = _parse_headers(email["raw"])
+    h    = _parse_headers(email["raw"])
     frm  = h["from"] or "(unknown sender)"
     subj = h["subject"] or "(no subject)"
     return f" #{email['index']}  {frm}  —  {subj}"[:72]
+
+
+def _thread_emails(emails: list) -> list:
+    """
+    Given a flat list of email dicts, return a list of 'thread roots'.
+    Each root is a dict:
+      {
+        "email"   : <the original email dict>,
+        "replies" : [<email dict>, …]   ← direct children, in order
+      }
+    Emails whose In-Reply-To matches another email's Message-ID are nested.
+    Everything else is a root.
+    """
+    by_msg_id = {}
+    for em in emails:
+        mid = em.get("message_id") or _parse_headers(em["raw"]).get("message_id", "")
+        if mid:
+            by_msg_id[mid] = em
+
+    roots   = []
+    replies = {}   # parent_msg_id → [child email, …]
+
+    for em in emails:
+        irt = em.get("in_reply_to") or _parse_headers(em["raw"]).get("in_reply_to", "")
+        if irt and irt in by_msg_id:
+            replies.setdefault(irt, []).append(em)
+        else:
+            roots.append(em)
+
+    threaded = []
+    for root in roots:
+        mid = root.get("message_id") or _parse_headers(root["raw"]).get("message_id", "")
+        threaded.append({
+            "email":   root,
+            "replies": replies.get(mid, []),
+        })
+    return threaded
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,7 +298,6 @@ class LoginScreen(tk.Frame):
         self.update_idletasks()
 
         def _work():
-            # Verify credentials against the live POP3 server
             ok, result = fetch_emails(email, pw)
             if ok or isinstance(result, list):
                 self.after(0, lambda: self._on_success(email, pw))
@@ -267,16 +329,25 @@ class MainApp(tk.Frame):
         self._password = password
         self._logout   = on_logout
 
-        # Per-folder email lists
+        # Per-folder flat email lists (raw from server/cache)
         self._inbox_emails: list = []
         self._spam_emails:  list = []
+        self._sent_emails:  list = []
 
-        # Currently selected (folder, list-row index)
+        # Threaded view data: list of {"email": …, "replies": […]}
+        self._inbox_threads: list = []
+        self._spam_threads:  list = []
+
+        # Currently selected item
         self._sel_folder:   str = "inbox"
         self._sel_list_idx: int = -1
+        self._sel_is_reply: bool = False   # True if the selected item is a reply row
+
+        # Reply-compose state: Message-ID of email being replied to
+        self._reply_to_msg_id: str = ""
 
         self._build()
-        self._load_from_cache()   # show cached mail immediately, before network
+        self._load_from_cache()
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -308,14 +379,17 @@ class MainApp(tk.Frame):
         ct = tk.Frame(self._nb, bg=BG)
         it = tk.Frame(self._nb, bg=BG)
         st = tk.Frame(self._nb, bg=BG)
+        sent_t = tk.Frame(self._nb, bg=BG)
 
-        self._nb.add(ct, text="  ✉  Compose  ")
-        self._nb.add(it, text="  📥  Inbox  ")
-        self._nb.add(st, text="  🚫  Spam  ")
+        self._nb.add(ct,     text="  ✉  Compose  ")
+        self._nb.add(it,     text="  📥  Inbox  ")
+        self._nb.add(st,     text="  🚫  Spam  ")
+        self._nb.add(sent_t, text="  📤  Sent  ")
 
         self._build_compose(ct)
         self._build_mail_tab(it, "inbox")
         self._build_mail_tab(st, "spam")
+        self._build_sent_tab(sent_t)
 
         # ── Status bar ─────────────────────────────────────────────────────────
         self._sv = tk.StringVar(value="Ready.")
@@ -330,20 +404,36 @@ class MainApp(tk.Frame):
                  fg=MUTED, anchor="w").pack(fill="x", padx=20, pady=(10, 2))
 
     def _build_compose(self, f):
-        self._lbl(f, "To:")
+        self._lbl(f, "To:  (comma-separated)")
         self._to = _entry(f)
         self._to.pack(fill="x", padx=20, ipady=4)
+
+        self._lbl(f, "CC:  (optional, comma-separated)")
+        self._cc = _entry(f)
+        self._cc.pack(fill="x", padx=20, ipady=4)
+
+        self._lbl(f, "BCC:  (optional, comma-separated — recipients hidden from others)")
+        self._bcc = _entry(f)
+        self._bcc.pack(fill="x", padx=20, ipady=4)
 
         self._lbl(f, "Subject:")
         self._subj = _entry(f)
         self._subj.pack(fill="x", padx=20, ipady=4)
+
+        # Hidden label showing the In-Reply-To context
+        self._reply_ctx_var = tk.StringVar(value="")
+        self._reply_ctx_lbl = tk.Label(
+            f, textvariable=self._reply_ctx_var,
+            font=FONT_I, bg=BG, fg=MUTED, anchor="w",
+        )
+        self._reply_ctx_lbl.pack(fill="x", padx=20)
 
         self._lbl(f, "Message:")
         self._body = tk.Text(
             f, font=FONT, bg=PANEL, fg=WHITE,
             insertbackground=WHITE, relief="flat",
             highlightthickness=1, highlightcolor=ACCENT,
-            highlightbackground=BORDER, height=14,
+            highlightbackground=BORDER, height=12,
         )
         self._body.pack(fill="both", expand=True, padx=20, pady=(2, 10))
 
@@ -354,18 +444,48 @@ class MainApp(tk.Frame):
         _btn(row, "  Clear  ", self._clear_compose,
              fg=MUTED, bg=PANEL).pack(side="left", padx=6)
 
-    # ── Generic mail tab (Inbox / Spam) ───────────────────────────────────────
+    # ── Sent tab ──────────────────────────────────────────────────────────────
+
+    def _build_sent_tab(self, f):
+        top = tk.Frame(f, bg=BG)
+        top.pack(fill="x", padx=20, pady=(10, 6))
+        tk.Label(top, text="📤  Sent", font=FONT_H,
+                 bg=BG, fg=WHITE).pack(side="left")
+
+        pane = tk.PanedWindow(f, orient="horizontal", bg=BG,
+                              sashwidth=4, sashrelief="flat")
+        pane.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+
+        lf = tk.Frame(pane, bg=PANEL, width=280,
+                      highlightthickness=1, highlightbackground=BORDER)
+        pane.add(lf, minsize=200)
+
+        self._sent_lb = tk.Listbox(
+            lf, font=FONT_S, bg=PANEL, fg=WHITE,
+            selectbackground=ACCENT, selectforeground=WHITE,
+            relief="flat", borderwidth=0, activestyle="none",
+        )
+        self._sent_lb.pack(fill="both", expand=True, padx=4, pady=4)
+        self._sent_lb.bind("<<ListboxSelect>>", self._select_sent)
+
+        vf = tk.Frame(pane, bg=PANEL,
+                      highlightthickness=1, highlightbackground=BORDER)
+        pane.add(vf, minsize=300)
+
+        self._sent_view = scrolledtext.ScrolledText(
+            vf, font=FONT, bg=PANEL, fg=WHITE,
+            insertbackground=WHITE, relief="flat",
+            borderwidth=0, state="disabled", wrap="word",
+        )
+        self._sent_view.pack(fill="both", expand=True, padx=6, pady=6)
+
+    # ── Generic mail tab (Inbox / Spam) with threaded list ────────────────────
 
     def _build_mail_tab(self, f, folder: str):
-        """
-        Builds an identical layout for both Inbox and Spam tabs.
-        Stores widget references with folder-prefixed attribute names.
-        """
         label = "Inbox" if folder == "inbox" else "Spam"
         icon  = "📥"   if folder == "inbox" else "🚫"
         color = WHITE  if folder == "inbox" else ORANGE
 
-        # ── Top bar ────────────────────────────────────────────────────────────
         top = tk.Frame(f, bg=BG)
         top.pack(fill="x", padx=20, pady=(10, 6))
         tk.Label(top, text=f"{icon}  {label}", font=FONT_H,
@@ -374,13 +494,11 @@ class MainApp(tk.Frame):
              lambda fd=folder: self._fetch(fd),
              fg=GREEN, bg=PANEL).pack(side="right")
 
-        # ── Paned window: list | viewer ───────────────────────────────────────
         pane = tk.PanedWindow(f, orient="horizontal", bg=BG,
                               sashwidth=4, sashrelief="flat")
         pane.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
-        # Left: email list
-        lf = tk.Frame(pane, bg=PANEL, width=280,
+        lf = tk.Frame(pane, bg=PANEL, width=300,
                       highlightthickness=1, highlightbackground=BORDER)
         pane.add(lf, minsize=200)
 
@@ -393,7 +511,6 @@ class MainApp(tk.Frame):
         lb.bind("<<ListboxSelect>>",
                 lambda evt, fd=folder: self._select_email(evt, fd))
 
-        # Right: viewer + action buttons
         vf = tk.Frame(pane, bg=PANEL,
                       highlightthickness=1, highlightbackground=BORDER)
         pane.add(vf, minsize=300)
@@ -405,7 +522,6 @@ class MainApp(tk.Frame):
         )
         view.pack(fill="both", expand=True, padx=6, pady=(6, 4))
 
-        # Action buttons row (Reply / Delete)
         act = tk.Frame(vf, bg=PANEL)
         act.pack(fill="x", padx=6, pady=(0, 6))
 
@@ -419,20 +535,17 @@ class MainApp(tk.Frame):
                           fg=WHITE, bg=RED)
         delete_btn.pack(side="left")
 
-        # Store widget refs using folder-prefixed names
         setattr(self, f"_{folder}_lb",         lb)
         setattr(self, f"_{folder}_view",        view)
         setattr(self, f"_{folder}_reply_btn",   reply_btn)
         setattr(self, f"_{folder}_delete_btn",  delete_btn)
 
-        # Disable action buttons until an email is selected
         reply_btn.config(state="disabled")
         delete_btn.config(state="disabled")
 
     # ── Cache: load on login ──────────────────────────────────────────────────
 
     def _load_from_cache(self):
-        """Populate both tabs from local cache immediately after login."""
         for folder in ("inbox", "spam"):
             cached = load_cache(self._email, folder)
             if cached:
@@ -441,6 +554,14 @@ class MainApp(tk.Frame):
                 self._set_status(
                     f"Showing {len(cached)} cached {folder} message(s). "
                     "Hit Refresh to fetch latest.", MUTED)
+
+        # Sent tab: load from local Sent cache
+        sent = load_sent(self._email)
+        if sent:
+            self._sent_emails = sent
+            self._populate_sent()
+            self._set_status(
+                f"Loaded {len(sent)} sent message(s) from local cache.", MUTED)
 
     # ── Network fetch ─────────────────────────────────────────────────────────
 
@@ -461,14 +582,14 @@ class MainApp(tk.Frame):
 
     def _on_fetch_ok(self, emails: list, folder: str):
         self._set_emails(folder, emails)
-        save_cache(self._email, folder, emails)   # persist to local cache
+        save_cache(self._email, folder, emails)
         self._populate(folder)
         count = len(emails)
         self._set_status(
             f"{count} message(s) in {folder}." if count
             else f"{folder.capitalize()} is empty.")
 
-    # ── Populate listbox ──────────────────────────────────────────────────────
+    # ── Email list helpers ────────────────────────────────────────────────────
 
     def _get_emails(self, folder: str) -> list:
         return self._inbox_emails if folder == "inbox" else self._spam_emails
@@ -476,57 +597,146 @@ class MainApp(tk.Frame):
     def _set_emails(self, folder: str, emails: list):
         if folder == "inbox":
             self._inbox_emails = emails
+            self._inbox_threads = _thread_emails(emails)
         else:
-            self._spam_emails = emails
+            self._spam_emails  = emails
+            self._spam_threads = _thread_emails(emails)
+
+    def _get_threads(self, folder: str) -> list:
+        return self._inbox_threads if folder == "inbox" else self._spam_threads
+
+    # ── Populate threaded listbox ─────────────────────────────────────────────
 
     def _populate(self, folder: str):
-        lb    = getattr(self, f"_{folder}_lb")
-        emails = self._get_emails(folder)
+        """
+        Fill the listbox with a threaded view.
+        We store a parallel map: listbox row index → (thread_idx, reply_idx or None)
+        """
+        lb      = getattr(self, f"_{folder}_lb")
+        threads = self._get_threads(folder)
 
         lb.delete(0, tk.END)
-        if not emails:
-            lb.insert(tk.END, f"  (empty {folder})")
-            return
-        for em in emails:
-            lb.insert(tk.END, _list_preview(em))
+        # row_map: list-row-index → {"thread": int, "reply": int|None}
+        row_map = []
 
-        # Reset action buttons
+        if not threads:
+            lb.insert(tk.END, "  (empty)")
+            setattr(self, f"_{folder}_row_map", [])
+            getattr(self, f"_{folder}_reply_btn").config(state="disabled")
+            getattr(self, f"_{folder}_delete_btn").config(state="disabled")
+            return
+
+        for t_idx, thread in enumerate(threads):
+            root_em = thread["email"]
+            h       = _parse_headers(root_em["raw"])
+            frm     = h["from"] or "(unknown)"
+            subj    = h["subject"] or "(no subject)"
+            label   = f" ✉ #{root_em['index']}  {frm}  —  {subj}"[:72]
+            lb.insert(tk.END, label)
+            lb.itemconfig(tk.END, fg=WHITE)
+            row_map.append({"thread": t_idx, "reply": None})
+
+            for r_idx, reply_em in enumerate(thread["replies"]):
+                rh    = _parse_headers(reply_em["raw"])
+                rfrm  = rh["from"] or "(unknown)"
+                rsubj = rh["subject"] or "(no subject)"
+                rlabel = f"    ↳ #{reply_em['index']}  {rfrm}  —  {rsubj}"[:72]
+                lb.insert(tk.END, rlabel)
+                lb.itemconfig(tk.END, fg=MUTED)
+                row_map.append({"thread": t_idx, "reply": r_idx})
+
+        setattr(self, f"_{folder}_row_map", row_map)
         getattr(self, f"_{folder}_reply_btn").config(state="disabled")
         getattr(self, f"_{folder}_delete_btn").config(state="disabled")
+
+    # ── Populate Sent listbox ─────────────────────────────────────────────────
+
+    def _populate_sent(self):
+        self._sent_lb.delete(0, tk.END)
+        if not self._sent_emails:
+            self._sent_lb.insert(tk.END, "  (no sent messages)")
+            return
+        for em in self._sent_emails:
+            h     = _parse_headers(em["raw"])
+            to_   = h["to"] or "(unknown recipient)"
+            subj  = h["subject"] or "(no subject)"
+            label = f" ✉ #{em['index']}  To: {to_}  —  {subj}"[:72]
+            self._sent_lb.insert(tk.END, label)
 
     # ── Email selection ───────────────────────────────────────────────────────
 
     def _select_email(self, _event, folder: str):
-        lb     = getattr(self, f"_{folder}_lb")
-        emails = self._get_emails(folder)
-        sel    = lb.curselection()
+        lb      = getattr(self, f"_{folder}_lb")
+        row_map = getattr(self, f"_{folder}_row_map", [])
+        threads = self._get_threads(folder)
+        sel     = lb.curselection()
 
-        if not sel or not emails:
+        if not sel or not threads:
             return
 
-        list_idx = sel[0]
-        if list_idx >= len(emails):
+        row_idx = sel[0]
+        if row_idx >= len(row_map):
             return
+
+        mapping = row_map[row_idx]
+        t_idx   = mapping["thread"]
+        r_idx   = mapping["reply"]   # None → root; int → reply
 
         self._sel_folder   = folder
-        self._sel_list_idx = list_idx
+        self._sel_list_idx = row_idx
+        self._sel_is_reply = r_idx is not None
 
+        thread = threads[t_idx]
+        if r_idx is None:
+            em = thread["email"]
+        else:
+            em = thread["replies"][r_idx]
+
+        # Display the selected email in the viewer
         view = getattr(self, f"_{folder}_view")
         view.config(state="normal")
         view.delete("1.0", tk.END)
-        view.insert(tk.END, emails[list_idx]["raw"])
+
+        # If showing a root with replies, show a conversation header
+        if r_idx is None and thread["replies"]:
+            reply_count = len(thread["replies"])
+            view.insert(tk.END,
+                f"── Conversation ({reply_count + 1} message"
+                f"{'s' if reply_count else ''}) ──\n\n",
+            )
+
+        view.insert(tk.END, em["raw"])
         view.config(state="disabled")
 
-        # Enable action buttons now that something is selected
         getattr(self, f"_{folder}_reply_btn").config(state="normal")
         getattr(self, f"_{folder}_delete_btn").config(state="normal")
+
+        # Store selected email for reply/delete actions
+        setattr(self, f"_{folder}_selected_email", em)
+
+    def _select_sent(self, _event):
+        sel = self._sent_lb.curselection()
+        if not sel or not self._sent_emails:
+            return
+        idx = sel[0]
+        if idx >= len(self._sent_emails):
+            return
+        em = self._sent_emails[idx]
+        self._sent_view.config(state="normal")
+        self._sent_view.delete("1.0", tk.END)
+        self._sent_view.insert(tk.END, em["raw"])
+        self._sent_view.config(state="disabled")
 
     # ── Compose helpers ───────────────────────────────────────────────────────
 
     def _send(self):
         to      = self._to.get().strip()
+        cc      = self._cc.get().strip()
+        bcc     = self._bcc.get().strip()
         subject = self._subj.get().strip() or "(no subject)"
         body    = self._body.get("1.0", tk.END).strip()
+        in_reply_to = self._reply_to_msg_id
+
         if not to or not body:
             messagebox.showwarning("Missing Fields",
                                    "Please fill in 'To' and 'Message'.")
@@ -534,67 +744,90 @@ class MainApp(tk.Frame):
         self._set_status("Sending…", YELLOW)
 
         def _work():
-            ok, msg = send_email(self._email, to, subject, body)
+            ok, result = send_email(
+                self._email, to, subject, body,
+                cc=cc, bcc=bcc, in_reply_to=in_reply_to,
+            )
             if ok:
-                self.after(0, lambda: (
-                    messagebox.showinfo("Sent ✓", msg),
-                    self._set_status(f"Sent to {to}.", GREEN),
-                    self._clear_compose(),
-                ))
+                # result is the sent_dict on success
+                sent_dict = result
+                # Save to Sent cache
+                append_sent(self._email, sent_dict)
+                self._sent_emails = load_sent(self._email)
+
+                def _after():
+                    # Update Sent tab
+                    self._populate_sent()
+                    messagebox.showinfo("Sent ✓", "Email sent successfully.")
+                    self._set_status(f"Sent to {to}.", GREEN)
+                    self._clear_compose()
+
+                self.after(0, _after)
             else:
                 self.after(0, lambda: (
-                    messagebox.showerror("Send Failed", msg),
-                    self._set_status(f"Failed: {msg}", RED),
+                    messagebox.showerror("Send Failed", result),
+                    self._set_status(f"Failed: {result}", RED),
                 ))
 
         threading.Thread(target=_work, daemon=True).start()
 
     def _clear_compose(self):
         self._to.delete(0, tk.END)
+        self._cc.delete(0, tk.END)
+        self._bcc.delete(0, tk.END)
         self._subj.delete(0, tk.END)
         self._body.delete("1.0", tk.END)
+        self._reply_to_msg_id = ""
+        self._reply_ctx_var.set("")
 
     # ── Reply ─────────────────────────────────────────────────────────────────
 
     def _reply(self, folder: str):
-        emails   = self._get_emails(folder)
-        list_idx = self._sel_list_idx
-
-        if list_idx < 0 or list_idx >= len(emails):
+        em = getattr(self, f"_{folder}_selected_email", None)
+        if em is None:
             messagebox.showwarning("Reply", "Please select an email to reply to.")
             return
 
-        raw     = emails[list_idx]["raw"]
-        headers = _parse_headers(raw)
+        headers = _parse_headers(em["raw"])
         to_addr = headers["from"]
         subject = headers["subject"]
+        msg_id  = headers.get("message_id") or em.get("message_id", "")
+
         reply_subj = (
             subject if subject.lower().startswith("re:")
             else f"Re: {subject}"
         )
 
-        # Pre-fill Compose tab and switch to it
+        # Store the Message-ID so send_email can attach In-Reply-To
+        self._reply_to_msg_id = msg_id
+
         self._to.delete(0, tk.END)
         self._to.insert(0, to_addr)
+        self._cc.delete(0, tk.END)
+        self._bcc.delete(0, tk.END)
         self._subj.delete(0, tk.END)
         self._subj.insert(0, reply_subj)
         self._body.delete("1.0", tk.END)
 
-        self._nb.select(0)   # switch to Compose tab (index 0)
+        # Show a subtle "Replying to …" context note
+        ctx = f"↩  Replying to: {to_addr}"
+        if msg_id:
+            ctx += f"  (In-Reply-To: {msg_id})"
+        self._reply_ctx_var.set(ctx)
+
+        self._nb.select(0)   # switch to Compose tab
         self._to.focus()
         self._set_status(f"Replying to {to_addr}…", ACCENT)
 
     # ── Delete ────────────────────────────────────────────────────────────────
 
     def _delete(self, folder: str):
-        emails   = self._get_emails(folder)
-        list_idx = self._sel_list_idx
-
-        if list_idx < 0 or list_idx >= len(emails):
+        em = getattr(self, f"_{folder}_selected_email", None)
+        if em is None:
             messagebox.showwarning("Delete", "Please select an email to delete.")
             return
 
-        msg_index = emails[list_idx]["index"]
+        msg_index = em["index"]
 
         if not messagebox.askyesno(
             "Confirm Delete",
@@ -603,9 +836,9 @@ class MainApp(tk.Frame):
         ):
             return
 
-        # ── 1. Remove from GUI immediately (optimistic UI) ────────────────────
-        emails.pop(list_idx)
-        # Re-number remaining emails so indices stay contiguous
+        # ── 1. Remove from local email list and rebuild threads ───────────────
+        emails = self._get_emails(folder)
+        emails = [e for e in emails if e["index"] != msg_index]
         for i, e in enumerate(emails, 1):
             e["index"] = i
         self._set_emails(folder, emails)
@@ -616,7 +849,7 @@ class MainApp(tk.Frame):
         view.config(state="normal")
         view.delete("1.0", tk.END)
         view.config(state="disabled")
-
+        setattr(self, f"_{folder}_selected_email", None)
         self._sel_list_idx = -1
 
         # ── 2. Remove from local cache ────────────────────────────────────────
@@ -667,7 +900,7 @@ class SecureMailController:
         self.root = root
         self.root.title("SecureMail")
         self.root.configure(bg=BG)
-        self.root.geometry("980x700")
+        self.root.geometry("1060x740")
         self._frame = None
         self._show_login()
 

@@ -1,22 +1,44 @@
 [
   {
     "index": 1,
-    "raw": "From: kiran@project.local\r\nTo: prashant@project.local\r\nSubject: Money found\r\n\r\nLottery received in college.Prince is chutiya."
+    "raw": "From: kiran@project.local\r\nTo: prashant@project.local\r\nSubject: Money found\r\n\r\nLottery received in college.Prince is chutiya.",
+    "message_id": "",
+    "in_reply_to": ""
   },
   {
     "index": 2,
-    "raw": "From: kiran@project.local\r\nTo: prashant@project.local\r\nSubject: lottery\r\n\r\nprince"
+    "raw": "From: kiran@project.local\r\nTo: prashant@project.local\r\nSubject: lottery\r\n\r\nprince",
+    "message_id": "",
+    "in_reply_to": ""
   },
   {
     "index": 3,
-    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: lottery\r\n\r\nprince"
+    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: lottery\r\n\r\nprince",
+    "message_id": "",
+    "in_reply_to": ""
   },
   {
     "index": 4,
-    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: bagri mc\r\n\r\nbagri bkl"
+    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: bagri mc\r\n\r\nbagri bkl",
+    "message_id": "",
+    "in_reply_to": ""
   },
   {
     "index": 5,
-    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: number theory assignment\r\n\r\nnumber theory"
+    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: number theory assignment\r\n\r\nnumber theory",
+    "message_id": "",
+    "in_reply_to": ""
+  },
+  {
+    "index": 6,
+    "raw": "From: kiran@project.local\r\nTo: prashant@project.local\r\nSubject: Re: lottery\r\n\r\nlet's fuck tonight",
+    "message_id": "",
+    "in_reply_to": ""
+  },
+  {
+    "index": 7,
+    "raw": "Message-ID: <1776179328527.6e2e256b@securemail>\r\nFrom: ronak@project.local\r\nTo: prashant@project.local, kiran@project.local\r\nSubject: Regarding Invited Talk on Securing AI Systems\r\n\r\nDear DR Academics\n\nCSE Department is organizing an invited talk in the area of Security AI Systems which will cover Cyber Attacks and Defenses in the area. Please circulate among UG/PG/PhD  students of the Institute for attendance. \n\nThe details of Speaker and Venue are attached below.",
+    "message_id": "<1776179328527.6e2e256b@securemail>",
+    "in_reply_to": ""
   }
 ]

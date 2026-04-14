@@ -3,9 +3,18 @@ Node 1 – POP3 Fetcher / Client (Prashant)
 ==========================================
 Connects through the Node 2 proxy to the Node 4 POP3 server.
 
+Changes in this version:
+  • fetch_emails now also parses Message-ID and In-Reply-To headers
+    so the GUI can build threaded conversation views.
+
 Exports:
   fetch_emails(username, password, folder="inbox")
-      → (True, [{"index": int, "raw": str}, …]) | (False, error_str)
+      → (True, [{
+            "index"       : int,
+            "raw"         : str,
+            "message_id"  : str,   ← NEW: value of Message-ID header
+            "in_reply_to" : str,   ← NEW: value of In-Reply-To header (or "")
+         }, …]) | (False, error_str)
 
   delete_email(username, password, folder, msg_index)
       → (True, "Message #N deleted.") | (False, error_str)
@@ -16,6 +25,7 @@ Exports:
 import socket
 import sys
 import os
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -49,6 +59,21 @@ def _recv_multiline(sock: socket.socket):
     status = lines[0]
     body   = lines[1].rsplit("\r\n.\r\n", 1)[0] if len(lines) > 1 else ""
     return status, body
+
+
+# ── Header parsing helper ─────────────────────────────────────────────────────
+
+def _extract_header(raw: str, header_name: str) -> str:
+    """
+    Return the value of the first occurrence of header_name (case-insensitive)
+    from the header block of a raw RFC-822 message, or "" if not found.
+    """
+    pattern = re.compile(
+        r"^" + re.escape(header_name) + r"\s*:\s*(.+)$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    m = pattern.search(raw)
+    return m.group(1).strip() if m else ""
 
 
 # ── Internal: connect + authenticate ─────────────────────────────────────────
@@ -101,8 +126,13 @@ def fetch_emails(username: str, password: str, folder: str = "inbox"):
 
     Returns
     -------
-    (True,  [{"index": int, "raw": str}, …])   on success
-    (False, error_str)                          on failure
+    (True,  [{
+        "index"       : int,
+        "raw"         : str,
+        "message_id"  : str,
+        "in_reply_to" : str,
+    }, …])                on success
+    (False, error_str)    on failure
     """
     sock = None
     try:
@@ -119,8 +149,8 @@ def fetch_emails(username: str, password: str, folder: str = "inbox"):
 
         # STAT – how many messages are in this folder?
         sock.sendall(b"STAT\r\n")
-        stat   = _recv_line(sock)          # +OK N total_bytes
-        parts  = stat.split()
+        stat  = _recv_line(sock)          # +OK N total_bytes
+        parts = stat.split()
         if len(parts) < 2 or not parts[1].isdigit():
             return False, f"Bad STAT response: {stat}"
         msg_count = int(parts[1])
@@ -131,7 +161,12 @@ def fetch_emails(username: str, password: str, folder: str = "inbox"):
             sock.sendall(f"RETR {i}\r\n".encode())
             status, body = _recv_multiline(sock)
             if status.startswith("+OK"):
-                emails.append({"index": i, "raw": body})
+                emails.append({
+                    "index":       i,
+                    "raw":         body,
+                    "message_id":  _extract_header(body, "Message-ID"),
+                    "in_reply_to": _extract_header(body, "In-Reply-To"),
+                })
 
         sock.sendall(b"QUIT\r\n")
         _recv_line(sock)
@@ -155,13 +190,6 @@ def delete_email(username: str, password: str, folder: str, msg_index: int):
     Uses the extended XDELE command which:
       1. Deletes the file from Node 4's storage immediately.
       2. Notifies Node 3 to delete its own copy of the same file.
-
-    Parameters
-    ----------
-    username  : str
-    password  : str
-    folder    : str   "inbox" or "spam"
-    msg_index : int   1-based message number
 
     Returns
     -------
