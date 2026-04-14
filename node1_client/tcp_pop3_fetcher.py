@@ -1,3 +1,18 @@
+"""
+Node 1 – POP3 Fetcher / Client (Prashant)
+==========================================
+Connects through the Node 2 proxy to the Node 4 POP3 server.
+
+Exports:
+  fetch_emails(username, password, folder="inbox")
+      → (True, [{"index": int, "raw": str}, …]) | (False, error_str)
+
+  delete_email(username, password, folder, msg_index)
+      → (True, "Message #N deleted.") | (False, error_str)
+      Uses XDELE – an extended command that immediately removes the
+      message from Node 4 AND triggers deletion on Node 3.
+"""
+
 import socket
 import sys
 import os
@@ -6,7 +21,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 
-def _recv_line(sock):
+# ── Socket helpers ────────────────────────────────────────────────────────────
+
+def _recv_line(sock: socket.socket) -> str:
     """Read one CRLF-terminated line from socket."""
     buf = b""
     while not buf.endswith(b"\r\n"):
@@ -17,61 +34,98 @@ def _recv_line(sock):
     return buf.decode("utf-8", errors="replace").strip()
 
 
-def _recv_multiline(sock):
-    """Read a POP3 multi-line response ending with CRLF.CRLF."""
+def _recv_multiline(sock: socket.socket):
+    """
+    Read a POP3 multi-line response ending with CRLF.CRLF.
+    Returns (status_line: str, body: str).
+    """
     buf = b""
     while not buf.endswith(b"\r\n.\r\n"):
         chunk = sock.recv(4096)
         if not chunk:
             raise ConnectionError("Connection closed mid-response")
         buf += chunk
-    # Strip the trailing \r\n.\r\n and the leading status line
     lines = buf.decode("utf-8", errors="replace").split("\r\n", 1)
     status = lines[0]
     body   = lines[1].rsplit("\r\n.\r\n", 1)[0] if len(lines) > 1 else ""
     return status, body
 
 
-def fetch_emails(username: str, password: str):
+# ── Internal: connect + authenticate ─────────────────────────────────────────
+
+def _connect_and_auth(username: str, password: str):
     """
-    Fetch all inbox emails for a user through the proxy.
-    Returns (success: bool, emails: list[dict] | error_str)
-    Each dict: {"index": int, "raw": str}
+    Open a connection through the proxy and log in.
+    Returns (socket, None) on success, (None, error_str) on failure.
+    Caller is responsible for closing the socket.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    sock.connect((config.PROXY_IP, config.PROXY_PORT))
+
+    # Announce POP3 route to proxy
+    sock.sendall(b"ROUTE:POP3\r\n")
+    ready = _recv_line(sock)
+    if ready != "READY":
+        sock.close()
+        return None, f"Proxy not ready: {ready}"
+
+    _recv_line(sock)  # consume +OK banner
+
+    sock.sendall(f"USER {username}\r\n".encode())
+    resp = _recv_line(sock)
+    if not resp.startswith("+OK"):
+        sock.close()
+        return None, f"USER rejected: {resp}"
+
+    sock.sendall(f"PASS {password}\r\n".encode())
+    resp = _recv_line(sock)
+    if resp.startswith("-ERR"):
+        sock.close()
+        return None, "Authentication failed. Check username/password."
+
+    return sock, None
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def fetch_emails(username: str, password: str, folder: str = "inbox"):
+    """
+    Fetch all emails from the specified folder via proxy → Node 4.
+
+    Parameters
+    ----------
+    username : str   e.g. "xyz@project.local"
+    password : str
+    folder   : str   "inbox" (default) or "spam"
+
+    Returns
+    -------
+    (True,  [{"index": int, "raw": str}, …])   on success
+    (False, error_str)                          on failure
     """
     sock = None
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(15)
-        sock.connect((config.PROXY_IP, config.PROXY_PORT))
+        sock, err = _connect_and_auth(username, password)
+        if err:
+            return False, err
 
-        # ── Route announcement ──────────────────────────────────
-        sock.sendall(b"ROUTE:POP3\r\n")
-        ready = _recv_line(sock)
-        if ready != "READY":
-            return False, f"Proxy not ready: {ready}"
+        # Switch folder if not the default inbox
+        if folder != "inbox":
+            sock.sendall(f"XFOLDER {folder}\r\n".encode())
+            resp = _recv_line(sock)
+            if not resp.startswith("+OK"):
+                return False, f"Could not switch to '{folder}': {resp}"
 
-        # ── POP3 login ──────────────────────────────────────────
-        _recv_line(sock)  # +OK banner
-
-        sock.sendall(f"USER {username}\r\n".encode())
-        resp = _recv_line(sock)
-        if not resp.startswith("+OK"):
-            return False, f"USER rejected: {resp}"
-
-        sock.sendall(f"PASS {password}\r\n".encode())
-        resp = _recv_line(sock)
-        if resp.startswith("-ERR"):
-            return False, "Authentication failed. Check username/password."
-
-        # ── STAT – how many messages? ───────────────────────────
+        # STAT – how many messages are in this folder?
         sock.sendall(b"STAT\r\n")
-        stat = _recv_line(sock)  # +OK N M
-        parts = stat.split()
+        stat   = _recv_line(sock)          # +OK N total_bytes
+        parts  = stat.split()
         if len(parts) < 2 or not parts[1].isdigit():
             return False, f"Bad STAT response: {stat}"
         msg_count = int(parts[1])
 
-        # ── RETR each message ───────────────────────────────────
+        # RETR each message
         emails = []
         for i in range(1, msg_count + 1):
             sock.sendall(f"RETR {i}\r\n".encode())
@@ -82,6 +136,60 @@ def fetch_emails(username: str, password: str):
         sock.sendall(b"QUIT\r\n")
         _recv_line(sock)
         return True, emails
+
+    except ConnectionRefusedError:
+        return False, "Could not connect to proxy. Is Node 2 running?"
+    except socket.timeout:
+        return False, "Connection timed out."
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if sock:
+            sock.close()
+
+
+def delete_email(username: str, password: str, folder: str, msg_index: int):
+    """
+    Immediately delete message #msg_index from *folder* on Node 4.
+
+    Uses the extended XDELE command which:
+      1. Deletes the file from Node 4's storage immediately.
+      2. Notifies Node 3 to delete its own copy of the same file.
+
+    Parameters
+    ----------
+    username  : str
+    password  : str
+    folder    : str   "inbox" or "spam"
+    msg_index : int   1-based message number
+
+    Returns
+    -------
+    (True,  "Message #N deleted.")  on success
+    (False, error_str)              on failure
+    """
+    sock = None
+    try:
+        sock, err = _connect_and_auth(username, password)
+        if err:
+            return False, err
+
+        # Switch to the target folder
+        if folder != "inbox":
+            sock.sendall(f"XFOLDER {folder}\r\n".encode())
+            resp = _recv_line(sock)
+            if not resp.startswith("+OK"):
+                return False, f"Could not switch to '{folder}': {resp}"
+
+        # XDELE = immediate delete + cross-node notification
+        sock.sendall(f"XDELE {msg_index}\r\n".encode())
+        resp = _recv_line(sock)
+        if not resp.startswith("+OK"):
+            return False, f"Delete failed: {resp}"
+
+        sock.sendall(b"QUIT\r\n")
+        _recv_line(sock)
+        return True, f"Message #{msg_index} deleted."
 
     except ConnectionRefusedError:
         return False, "Could not connect to proxy. Is Node 2 running?"

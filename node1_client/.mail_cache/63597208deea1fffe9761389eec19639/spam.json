@@ -1,0 +1,22 @@
+[
+  {
+    "index": 1,
+    "raw": "From: kiran@project.local\r\nTo: prashant@project.local\r\nSubject: Money found\r\n\r\nLottery received in college.Prince is chutiya."
+  },
+  {
+    "index": 2,
+    "raw": "From: kiran@project.local\r\nTo: prashant@project.local\r\nSubject: lottery\r\n\r\nprince"
+  },
+  {
+    "index": 3,
+    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: lottery\r\n\r\nprince"
+  },
+  {
+    "index": 4,
+    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: bagri mc\r\n\r\nbagri bkl"
+  },
+  {
+    "index": 5,
+    "raw": "From: prashant@project.local\r\nTo: prashant@project.local\r\nSubject: number theory assignment\r\n\r\nnumber theory"
+  }
+]
