@@ -16,8 +16,8 @@ REGISTRATION_PORT  = 4502   # Node 4 registration server
 DELETE_PORT = 4503   # Node 4 → Node 3 deletion notification
 
 PROXY_PORT    = 8000
-SMTP_PORT     = 2525
-POP3_PORT     = 1100
+SMTP_PORT     = 25
+POP3_PORT     = 110
 DNS_SPAM_PORT = 5053
 DELETE_PORT = 4503
 
